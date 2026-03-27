@@ -1,10 +1,11 @@
 import path from "node:path";
+import fs from "node:fs/promises";
 import { OpenAIClient } from "../ai/openai-client.js";
 import { ResolvedCompileConfig } from "../config/types.js";
 import { emitGeneratedProject } from "../emitter/project-emitter.js";
-import { createLogger } from "../utils/logger.js";
 import { loadSpecProject } from "../spec/loader.js";
-import { ensureDirectory, writeJsonFile } from "../utils/fs.js";
+import { ensureDirectory, writeJsonFile, writeTextFile } from "../utils/fs.js";
+import { createLogger } from "../utils/logger.js";
 
 export type GeneratedFile = {
   path: string;
@@ -16,16 +17,13 @@ export type CompileResult = {
   warnings: string[];
 };
 
-type ModelFilePayload = {
-  path: string;
-  content: string;
+type StreamParseState = {
+  buffer: string;
+  transcript: string;
+  files: Map<string, string>;
 };
 
-type ModelCompilePayload = {
-  summary?: string;
-  warnings?: string[];
-  files?: ModelFilePayload[];
-};
+type CompileTarget = "frontend" | "backend";
 
 export async function compileSpecProject(
   config: ResolvedCompileConfig
@@ -41,130 +39,220 @@ export async function compileSpecProject(
     logger.warn(warning);
   }
 
+  if (config.compile.clean) {
+    await fs.rm(config.outDir, { recursive: true, force: true });
+  }
+  await ensureDirectory(config.outDir);
+
   const client = new OpenAIClient({
     host: config.host,
     auth: config.auth,
     timeout: config.timeout
   });
 
+  const planMessages = buildPlanMessages(project.promptContext, config);
   logger.step("3/5", "Requesting AI compile plan");
-  logger.debug(
-    config.compile.debug,
-    "plan request",
-    JSON.stringify(buildPlanMessages(project.promptContext, config), null, 2)
-  );
-  await client.streamChatCompletion(
+  logger.debug(config.compile.debug, "plan request", JSON.stringify(planMessages, null, 2));
+  const compilePlan = await client.streamChatCompletion(
     {
       model: config.model,
       temperature: config.ai.temperature,
-      messages: buildPlanMessages(project.promptContext, config)
+      messages: planMessages
     },
-    chunk => process.stdout.write(chunk)
+    chunk => {
+      process.stdout.write(chunk);
+    }
   );
   process.stdout.write("\n");
 
-  logger.step("4/5", "Generating project files");
-  const generationMessages = buildGenerationMessages(project.promptContext, config);
-  logger.debug(
-    config.compile.debug,
-    "generate request",
-    JSON.stringify(generationMessages, null, 2)
-  );
+  const targets = detectCompileTargets(project.promptContext, config);
+  if (targets.length === 0) {
+    throw new Error("No compile targets selected. Check the spec Environment or stack config.");
+  }
 
-  let completionText = "";
-  let repairedText: string | undefined;
-  let payload: ModelCompilePayload;
+  logger.step(
+    "4/5",
+    `Generating project files with ${targets.join(" + ")} agent(s)${
+      targets.length > 1 ? " in parallel" : ""
+    }`
+  );
+  const transcripts: Partial<Record<CompileTarget, string>> = {};
+  const promptTraceByTarget: Partial<Record<CompileTarget, ReturnType<typeof buildGenerationMessages>>> = {};
+  const filesMap = new Map<string, string>();
+  const generationTasks = targets.map(async target => {
+    const targetState: StreamParseState = {
+      buffer: "",
+      transcript: "",
+      files: filesMap
+    };
+
+    const generationMessages = buildGenerationMessages(
+      target,
+      project.promptContext,
+      compilePlan,
+      config
+    );
+    promptTraceByTarget[target] = generationMessages;
+
+    logger.step(
+      target === "frontend" ? "4a/5" : "4b/5",
+      `Running ${target} agent`
+    );
+    logger.debug(
+      config.compile.debug,
+      `${target} generate request`,
+      JSON.stringify(generationMessages, null, 2)
+    );
+
+    await client.streamChatCompletion(
+      {
+        model: config.model,
+        temperature: config.ai.temperature,
+        messages: generationMessages
+      },
+      async chunk => {
+        writeTargetChunk(target, chunk, targets.length > 1);
+        await consumeGenerationChunk(chunk, targetState, config, logger, target);
+      }
+    );
+
+    process.stdout.write("\n");
+    await flushCompletedFileBlocks(targetState, config, logger, target);
+    transcripts[target] = targetState.transcript;
+  });
 
   try {
-    completionText = await client.createChatCompletion({
-      model: config.model,
-      temperature: config.ai.temperature,
-      messages: generationMessages
-    });
-
-    logger.debug(config.compile.debug, "raw generate response", completionText);
-
-    const parsed = await parseCompilePayloadWithRepair({
-      raw: completionText,
-      client,
-      config,
-      logger
-    });
-    payload = parsed.payload;
-    repairedText = parsed.repairedText;
-
-    if (repairedText) {
-      logger.debug(config.compile.debug, "repaired generate response", repairedText);
-    }
+    await Promise.all(generationTasks);
   } catch (error) {
     await writeDebugFailureArtifacts({
       outDir: config.outDir,
-      planMessages: buildPlanMessages(project.promptContext, config),
-      generationMessages,
-      rawGenerateResponse: completionText,
+      planMessages,
+      compilePlan,
+      generationMessagesByTarget: promptTraceByTarget,
+      generationTranscriptsByTarget: transcripts,
       errorMessage: error instanceof Error ? error.message : String(error)
     });
-
     throw error;
   }
 
-  const files = normalizeGeneratedFiles(payload.files ?? []);
-  const allWarnings = [...warnings, ...(payload.warnings ?? [])];
+  const files = Array.from(filesMap.entries()).map(([filePath, content]) => ({
+    path: filePath,
+    content
+  }));
 
-  logger.step("5/5", `Writing generated files into ${config.outDir}`);
+  if (files.length === 0) {
+    await writeDebugFailureArtifacts({
+      outDir: config.outDir,
+      planMessages,
+      compilePlan,
+      generationMessagesByTarget: promptTraceByTarget,
+      generationTranscriptsByTarget: transcripts,
+      errorMessage: "No file blocks were parsed from the streamed model output."
+    });
+    throw new Error(
+      "AI compile output did not contain any parsable file blocks. Use --debug and check dist/.specos/prompt-trace.json."
+    );
+  }
+
+  logger.step("5/5", `Finalizing compile output in ${config.outDir}`);
   await emitGeneratedProject({
     outDir: config.outDir,
-    clean: config.compile.clean,
+    clean: false,
     files,
     metadata: {
       generatedAt: new Date().toISOString(),
       projectDir: config.projectDir,
       model: config.model,
-      summary: payload.summary ?? "",
-      warnings: allWarnings
+      summary: `Generated ${files.length} files from streamed code blocks.`,
+      warnings
     },
     promptTrace: {
-      plan: buildPlanMessages(project.promptContext, config),
-      generate: buildGenerationMessages(project.promptContext, config),
-      rawGenerateResponse: completionText,
-      repairedGenerateResponse: repairedText ?? null
+      plan: planMessages,
+      compilePlan,
+      targets,
+      generateByTarget: promptTraceByTarget,
+      generationTranscriptsByTarget: transcripts,
+      protocol: getFileBlockProtocolDescription()
     }
   });
 
   return {
     files,
-    warnings: allWarnings
+    warnings
   };
 }
 
-async function parseCompilePayloadWithRepair(input: {
-  raw: string;
-  client: OpenAIClient;
-  config: ResolvedCompileConfig;
-  logger: ReturnType<typeof createLogger>;
-}): Promise<{ payload: ModelCompilePayload; repairedText?: string }> {
-  try {
-    return { payload: parseCompilePayload(input.raw) };
-  } catch (error) {
-    input.logger.warn("Primary AI response was not valid JSON. Attempting one repair pass.");
-
-    const repaired = await input.client.createChatCompletion({
-      model: input.config.model,
-      temperature: 0,
-      messages: buildRepairMessages(input.raw)
-    });
-
-    try {
-      return {
-        payload: parseCompilePayload(repaired),
-        repairedText: repaired
-      };
-    } catch {
-      throw new Error(
-        "AI compile response did not contain valid JSON. Check dist/.specos/prompt-trace.json for the raw model output."
-      );
-    }
+function writeTargetChunk(
+  target: CompileTarget,
+  chunk: string,
+  prefixOutput: boolean
+): void {
+  if (!prefixOutput) {
+    process.stdout.write(chunk);
+    return;
   }
+
+  const label = `[${target}] `;
+  const normalized = chunk.replace(/\n/g, `\n${label}`);
+  process.stdout.write(`${label}${normalized}`);
+}
+
+async function consumeGenerationChunk(
+  chunk: string,
+  state: StreamParseState,
+  config: ResolvedCompileConfig,
+  logger: ReturnType<typeof createLogger>,
+  target: CompileTarget
+): Promise<void> {
+  state.buffer += chunk;
+  state.transcript += chunk;
+  await flushCompletedFileBlocks(state, config, logger, target);
+}
+
+async function flushCompletedFileBlocks(
+  state: StreamParseState,
+  config: ResolvedCompileConfig,
+  logger: ReturnType<typeof createLogger>,
+  target: CompileTarget
+): Promise<void> {
+  while (true) {
+    const match = matchNextCompletedFileBlock(state.buffer);
+    if (!match) {
+      break;
+    }
+
+    const generatedFile = normalizeGeneratedFile(match.path, match.content);
+    state.files.set(generatedFile.path, generatedFile.content);
+    await writeGeneratedFile(config.outDir, generatedFile);
+    logger.step(`write:${target}`, generatedFile.path);
+
+    state.buffer = state.buffer.slice(match.endIndex);
+  }
+}
+
+function matchNextCompletedFileBlock(input: string):
+  | {
+      path: string;
+      content: string;
+      endIndex: number;
+    }
+  | undefined {
+  const fileHeaderMatch = /FILE:\s*([^\n]+)\n```([a-zA-Z0-9._+-]*)?\n/.exec(input);
+  if (!fileHeaderMatch || fileHeaderMatch.index === undefined) {
+    return undefined;
+  }
+
+  const contentStart = fileHeaderMatch.index + fileHeaderMatch[0].length;
+  const fenceEndIndex = input.indexOf("\n```", contentStart);
+  if (fenceEndIndex === -1) {
+    return undefined;
+  }
+
+  return {
+    path: fileHeaderMatch[1].trim(),
+    content: input.slice(contentStart, fenceEndIndex),
+    endIndex: fenceEndIndex + "\n```".length
+  };
 }
 
 function buildPlanMessages(specContext: string, config: ResolvedCompileConfig) {
@@ -191,43 +279,60 @@ Explain the compile plan and major files you will create.`
   ];
 }
 
-function buildGenerationMessages(specContext: string, config: ResolvedCompileConfig) {
+function buildGenerationMessages(
+  target: CompileTarget,
+  specContext: string,
+  compilePlan: string,
+  config: ResolvedCompileConfig
+) {
+  const targetInstructions = getTargetInstructions(target, config);
+
   return [
     {
       role: "system" as const,
       content:
-        "You are the SpecOS compile agent. Convert the provided spec project into a runnable application skeleton. Return JSON only. No markdown fences. No prose outside JSON."
+        `You are the SpecOS ${target} compile agent. Generate executable project files, not JSON. Stream the answer as code blocks only. Each file must start with \`FILE: relative/path\` on its own line, followed immediately by a fenced code block. You may emit the same file path again later with a more complete version; the compiler will treat the latest block as the current file content.`
     },
     {
       role: "user" as const,
-      content: `Generate a project using:
+      content: `Generate ${target} project files using:
 - Frontend: ${config.stack.frontend}
 - UI Library: ${config.stack.ui}
 - Frontend Language: ${config.stack.language}
 - Backend: ${config.stack.backend}
 - Database: ${config.stack.database}
 
-Return JSON with this exact shape:
+Use this compile plan from the previous step as a hard guide for file layout, implementation order, and module boundaries:
+${compilePlan.trim() || "(empty plan output)"}
+
+Target-specific requirements:
+${targetInstructions}
+
+Output protocol:
+FILE: frontend/package.json
+\`\`\`json
 {
-  "summary": "short summary",
-  "warnings": ["warning"],
-  "files": [
-    {
-      "path": "frontend/package.json",
-      "content": "file content"
-    }
-  ]
+  "name": "frontend"
 }
+\`\`\`
+
+FILE: frontend/src/App.tsx
+\`\`\`tsx
+export default function App() {
+  return <div>Hello</div>;
+}
+\`\`\`
 
 Rules:
-- Include a minimal but coherent full-stack project.
-- Use TypeScript in the frontend.
-- Use Flask and pymongo in the backend.
-- Keep files compact, but runnable after dependency installation.
-- Include frontend and backend README files if useful.
-- Ensure API routes and frontend API calls match the spec.
-- Do not omit package manifests or dependency files.
-- Paths must be relative, never absolute.
+- Output executable code and config files, not a JSON manifest.
+- Use only the FILE + fenced code block protocol.
+- Do not add explanations outside file blocks.
+- Use relative paths only.
+- Generate a minimal but coherent full-stack project.
+- If you are the frontend agent, only emit frontend or shared client-facing files.
+- If you are the backend agent, only emit backend or shared server-facing files.
+- Include package/dependency files needed to install and run the project.
+- Prefer complete file replacements if you revise a file later in the stream.
 
 Spec project:
 ${specContext}`
@@ -235,33 +340,57 @@ ${specContext}`
   ];
 }
 
-function buildRepairMessages(rawOutput: string) {
-  return [
-    {
-      role: "system" as const,
-      content:
-        "You are a JSON repair agent. Convert the provided model output into valid JSON only. No markdown fences. No explanation."
-    },
-    {
-      role: "user" as const,
-      content: `Return JSON with this exact shape:
-{
-  "summary": "short summary",
-  "warnings": ["warning"],
-  "files": [
-    {
-      "path": "frontend/package.json",
-      "content": "file content"
-    }
-  ]
+function getTargetInstructions(target: CompileTarget, config: ResolvedCompileConfig): string {
+  if (target === "frontend") {
+    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit files under frontend/ only. Implement pages, components, API client calls, and frontend package configuration. Do not emit backend files or shared files.`;
+  }
+
+  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit files under backend/ only. Implement Flask app setup, routes, models, services, dependency files, and backend run instructions. Do not emit frontend files or shared files.`;
 }
 
-If the input contains prose or markdown, extract the intended JSON payload and repair escaping issues.
+function detectCompileTargets(
+  specContext: string,
+  config: ResolvedCompileConfig
+): CompileTarget[] {
+  const targets: CompileTarget[] = [];
 
-Model output to repair:
-${rawOutput}`
-    }
-  ];
+  if (!isTargetDisabled("frontend", specContext, config)) {
+    targets.push("frontend");
+  }
+
+  if (!isTargetDisabled("backend", specContext, config)) {
+    targets.push("backend");
+  }
+
+  return targets;
+}
+
+function isTargetDisabled(
+  target: CompileTarget,
+  specContext: string,
+  config: ResolvedCompileConfig
+): boolean {
+  const stackValue = target === "frontend" ? config.stack.frontend : config.stack.backend;
+  if (isDisabledValue(stackValue)) {
+    return true;
+  }
+
+  const pattern = target === "frontend" ? /Frontend:\s*([^\n]+)/i : /Backend:\s*([^\n]+)/i;
+  const match = specContext.match(pattern);
+  if (!match) {
+    return false;
+  }
+
+  return isDisabledValue(match[1]);
+}
+
+function isDisabledValue(value: string | undefined): boolean {
+  if (!value) {
+    return false;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  return ["none", "no", "false", "disabled", "disable", "null", "n/a"].includes(normalized);
 }
 
 function validateSpecFiles(files: string[]): string[] {
@@ -274,39 +403,8 @@ function validateSpecFiles(files: string[]): string[] {
   return warnings;
 }
 
-function parseCompilePayload(raw: string): ModelCompilePayload {
-  const trimmed = raw.trim();
-  const withoutCodeFence = trimmed.replace(/^```json\s*|^```\s*|```$/gm, "").trim();
-  const jsonText = extractJsonObject(withoutCodeFence);
-
-  return JSON.parse(jsonText) as ModelCompilePayload;
-}
-
-function extractJsonObject(input: string): string {
-  const start = input.indexOf("{");
-  const end = input.lastIndexOf("}");
-
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error("AI compile response did not contain a JSON object");
-  }
-
-  return input.slice(start, end + 1);
-}
-
-function normalizeGeneratedFiles(files: ModelFilePayload[]): GeneratedFile[] {
-  const normalized = files
-    .filter(file => typeof file.path === "string" && typeof file.content === "string")
-    .map(file => normalizeGeneratedFile(file.path, file.content));
-
-  if (normalized.length === 0) {
-    throw new Error("AI compile response did not contain any files");
-  }
-
-  return normalized;
-}
-
 function normalizeGeneratedFile(filePath: string, content: string): GeneratedFile {
-  const normalizedPath = filePath.replace(/^\/+/, "");
+  const normalizedPath = filePath.replace(/^\/+/, "").trim();
 
   if (
     normalizedPath.startsWith("..") ||
@@ -319,23 +417,36 @@ function normalizeGeneratedFile(filePath: string, content: string): GeneratedFil
 
   return {
     path: normalizedPath,
-    content
+    content: content.replace(/\s+$/, "") + "\n"
   };
+}
+
+async function writeGeneratedFile(outDir: string, file: GeneratedFile): Promise<void> {
+  const targetPath = path.join(outDir, file.path);
+  await ensureDirectory(path.dirname(targetPath));
+  await writeTextFile(targetPath, file.content);
 }
 
 async function writeDebugFailureArtifacts(input: {
   outDir: string;
   planMessages: ReturnType<typeof buildPlanMessages>;
-  generationMessages: ReturnType<typeof buildGenerationMessages>;
-  rawGenerateResponse: string;
+  compilePlan: string;
+  generationMessagesByTarget: Partial<Record<CompileTarget, ReturnType<typeof buildGenerationMessages>>>;
+  generationTranscriptsByTarget: Partial<Record<CompileTarget, string>>;
   errorMessage: string;
 }): Promise<void> {
   const metaDir = path.join(input.outDir, ".specos");
   await ensureDirectory(metaDir);
   await writeJsonFile(path.join(metaDir, "prompt-trace.json"), {
     plan: input.planMessages,
-    generate: input.generationMessages,
-    rawGenerateResponse: input.rawGenerateResponse,
+    compilePlan: input.compilePlan,
+    generateByTarget: input.generationMessagesByTarget,
+    generationTranscriptsByTarget: input.generationTranscriptsByTarget,
+    protocol: getFileBlockProtocolDescription(),
     error: input.errorMessage
   });
+}
+
+function getFileBlockProtocolDescription(): string {
+  return "Each generated file must be emitted as `FILE: relative/path` followed by a fenced code block. Later blocks for the same path replace the previous file content.";
 }

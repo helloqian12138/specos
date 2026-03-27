@@ -44,8 +44,8 @@ export class OpenAIClient {
       messages: ChatMessage[];
       temperature?: number;
     },
-    onDelta: (chunk: string) => void
-  ): Promise<void> {
+    onDelta: (chunk: string) => void | Promise<void>
+  ): Promise<string> {
     const response = await this.request({
       ...input,
       stream: true
@@ -62,6 +62,7 @@ export class OpenAIClient {
 
     const decoder = new TextDecoder();
     let buffer = "";
+    let fullText = "";
 
     for await (const chunk of response.body) {
       buffer += decoder.decode(chunk, { stream: true });
@@ -78,7 +79,7 @@ export class OpenAIClient {
         const payloadText = trimmed.slice(5).trim();
 
         if (payloadText === "[DONE]") {
-          return;
+          return fullText;
         }
 
         const payload = JSON.parse(payloadText) as {
@@ -91,10 +92,13 @@ export class OpenAIClient {
 
         const text = extractMessageText(payload.choices?.[0]?.delta?.content);
         if (text) {
-          onDelta(text);
+          fullText += text;
+          await onDelta(text);
         }
       }
     }
+
+    return fullText;
   }
 
   private async request(body: Record<string, unknown>): Promise<Response> {
