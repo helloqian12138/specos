@@ -1,5 +1,6 @@
 import { runCompileCommand } from "./commands/compile.js";
 import { runInitCommand } from "./commands/init.js";
+import { runRunCommand } from "./commands/run.js";
 
 type ParsedArgs = {
   command?: string;
@@ -22,6 +23,9 @@ export async function main(argv: string[]): Promise<void> {
         return;
       case "compile":
         await runCompileCommand(parsed);
+        return;
+      case "run":
+        await runRunCommand(parsed);
         return;
       default:
         throw new Error(`Unknown command: ${parsed.command}`);
@@ -70,12 +74,14 @@ Usage:
   spec init --config <file>
   spec init --project [dir]
   spec compile <projectDir> [--outDir <path>] [--model <name>] [--host <url>] [--debug]
+  spec run <projectDir> [--outDir <path>] [--frontend-only] [--backend-only] [--install] [--watch] [--dev]
 
 Examples:
   spec init --host https://api.openai.com/v1 --auth sk-...
   spec init --config ./spec.global.json
   spec init --project ./examples/todo-app
   spec compile ./examples/todo-app
+  spec run ./examples/todo-app --install
 `);
 }
 

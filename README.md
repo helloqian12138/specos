@@ -61,6 +61,24 @@ Debug compile output:
 spec compile ./examples/todo-app --debug
 ```
 
+Run a generated project:
+
+```bash
+spec run ./examples/todo-app
+```
+
+Install dependencies before running:
+
+```bash
+spec run ./examples/todo-app --install
+```
+
+Run in dev/watch mode:
+
+```bash
+spec run ./examples/todo-app --dev
+```
+
 ## Project Config
 
 Each spec project can define its own `spec.config.js`:

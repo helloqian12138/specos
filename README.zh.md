@@ -59,6 +59,24 @@ spec compile ./examples/todo-app --outDir ./dist --model gpt-4o-mini
 spec compile ./examples/todo-app --debug
 ```
 
+运行已生成项目：
+
+```bash
+spec run ./examples/todo-app
+```
+
+运行前先安装依赖：
+
+```bash
+spec run ./examples/todo-app --install
+```
+
+用 dev/watch 模式运行：
+
+```bash
+spec run ./examples/todo-app --dev
+```
+
 ## 项目配置
 
 每个 spec 工程都可以有自己的 `spec.config.js`：
