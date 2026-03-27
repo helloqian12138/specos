@@ -48,7 +48,8 @@ export async function runCompileCommand(parsed: ParsedArgs): Promise<void> {
     },
     compile: {
       clean: projectConfig.compile?.clean ?? false,
-      verbose: booleanFlag(parsed.flags.verbose) ?? projectConfig.compile?.verbose ?? true
+      verbose: booleanFlag(parsed.flags.verbose) ?? projectConfig.compile?.verbose ?? true,
+      debug: booleanFlag(parsed.flags.debug) ?? false
     }
   };
 

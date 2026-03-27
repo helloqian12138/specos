@@ -4,6 +4,7 @@ import { ResolvedCompileConfig } from "../config/types.js";
 import { emitGeneratedProject } from "../emitter/project-emitter.js";
 import { createLogger } from "../utils/logger.js";
 import { loadSpecProject } from "../spec/loader.js";
+import { ensureDirectory, writeJsonFile } from "../utils/fs.js";
 
 export type GeneratedFile = {
   path: string;
@@ -47,6 +48,11 @@ export async function compileSpecProject(
   });
 
   logger.step("3/5", "Requesting AI compile plan");
+  logger.debug(
+    config.compile.debug,
+    "plan request",
+    JSON.stringify(buildPlanMessages(project.promptContext, config), null, 2)
+  );
   await client.streamChatCompletion(
     {
       model: config.model,
@@ -58,13 +64,50 @@ export async function compileSpecProject(
   process.stdout.write("\n");
 
   logger.step("4/5", "Generating project files");
-  const completionText = await client.createChatCompletion({
-    model: config.model,
-    temperature: config.ai.temperature,
-    messages: buildGenerationMessages(project.promptContext, config)
-  });
+  const generationMessages = buildGenerationMessages(project.promptContext, config);
+  logger.debug(
+    config.compile.debug,
+    "generate request",
+    JSON.stringify(generationMessages, null, 2)
+  );
 
-  const payload = parseCompilePayload(completionText);
+  let completionText = "";
+  let repairedText: string | undefined;
+  let payload: ModelCompilePayload;
+
+  try {
+    completionText = await client.createChatCompletion({
+      model: config.model,
+      temperature: config.ai.temperature,
+      messages: generationMessages
+    });
+
+    logger.debug(config.compile.debug, "raw generate response", completionText);
+
+    const parsed = await parseCompilePayloadWithRepair({
+      raw: completionText,
+      client,
+      config,
+      logger
+    });
+    payload = parsed.payload;
+    repairedText = parsed.repairedText;
+
+    if (repairedText) {
+      logger.debug(config.compile.debug, "repaired generate response", repairedText);
+    }
+  } catch (error) {
+    await writeDebugFailureArtifacts({
+      outDir: config.outDir,
+      planMessages: buildPlanMessages(project.promptContext, config),
+      generationMessages,
+      rawGenerateResponse: completionText,
+      errorMessage: error instanceof Error ? error.message : String(error)
+    });
+
+    throw error;
+  }
+
   const files = normalizeGeneratedFiles(payload.files ?? []);
   const allWarnings = [...warnings, ...(payload.warnings ?? [])];
 
@@ -82,7 +125,9 @@ export async function compileSpecProject(
     },
     promptTrace: {
       plan: buildPlanMessages(project.promptContext, config),
-      generate: buildGenerationMessages(project.promptContext, config)
+      generate: buildGenerationMessages(project.promptContext, config),
+      rawGenerateResponse: completionText,
+      repairedGenerateResponse: repairedText ?? null
     }
   });
 
@@ -90,6 +135,36 @@ export async function compileSpecProject(
     files,
     warnings: allWarnings
   };
+}
+
+async function parseCompilePayloadWithRepair(input: {
+  raw: string;
+  client: OpenAIClient;
+  config: ResolvedCompileConfig;
+  logger: ReturnType<typeof createLogger>;
+}): Promise<{ payload: ModelCompilePayload; repairedText?: string }> {
+  try {
+    return { payload: parseCompilePayload(input.raw) };
+  } catch (error) {
+    input.logger.warn("Primary AI response was not valid JSON. Attempting one repair pass.");
+
+    const repaired = await input.client.createChatCompletion({
+      model: input.config.model,
+      temperature: 0,
+      messages: buildRepairMessages(input.raw)
+    });
+
+    try {
+      return {
+        payload: parseCompilePayload(repaired),
+        repairedText: repaired
+      };
+    } catch {
+      throw new Error(
+        "AI compile response did not contain valid JSON. Check dist/.specos/prompt-trace.json for the raw model output."
+      );
+    }
+  }
 }
 
 function buildPlanMessages(specContext: string, config: ResolvedCompileConfig) {
@@ -160,6 +235,35 @@ ${specContext}`
   ];
 }
 
+function buildRepairMessages(rawOutput: string) {
+  return [
+    {
+      role: "system" as const,
+      content:
+        "You are a JSON repair agent. Convert the provided model output into valid JSON only. No markdown fences. No explanation."
+    },
+    {
+      role: "user" as const,
+      content: `Return JSON with this exact shape:
+{
+  "summary": "short summary",
+  "warnings": ["warning"],
+  "files": [
+    {
+      "path": "frontend/package.json",
+      "content": "file content"
+    }
+  ]
+}
+
+If the input contains prose or markdown, extract the intended JSON payload and repair escaping issues.
+
+Model output to repair:
+${rawOutput}`
+    }
+  ];
+}
+
 function validateSpecFiles(files: string[]): string[] {
   const warnings: string[] = [];
 
@@ -217,4 +321,21 @@ function normalizeGeneratedFile(filePath: string, content: string): GeneratedFil
     path: normalizedPath,
     content
   };
+}
+
+async function writeDebugFailureArtifacts(input: {
+  outDir: string;
+  planMessages: ReturnType<typeof buildPlanMessages>;
+  generationMessages: ReturnType<typeof buildGenerationMessages>;
+  rawGenerateResponse: string;
+  errorMessage: string;
+}): Promise<void> {
+  const metaDir = path.join(input.outDir, ".specos");
+  await ensureDirectory(metaDir);
+  await writeJsonFile(path.join(metaDir, "prompt-trace.json"), {
+    plan: input.planMessages,
+    generate: input.generationMessages,
+    rawGenerateResponse: input.rawGenerateResponse,
+    error: input.errorMessage
+  });
 }

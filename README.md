@@ -55,6 +55,12 @@ Override output or model at compile time:
 spec compile ./examples/todo-app --outDir ./dist --model gpt-4o-mini
 ```
 
+Debug compile output:
+
+```bash
+spec compile ./examples/todo-app --debug
+```
+
 ## Project Config
 
 Each spec project can define its own `spec.config.js`:

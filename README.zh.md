@@ -53,6 +53,12 @@ spec compile ./examples/todo-app
 spec compile ./examples/todo-app --outDir ./dist --model gpt-4o-mini
 ```
 
+打开 debug 输出：
+
+```bash
+spec compile ./examples/todo-app --debug
+```
+
 ## 项目配置
 
 每个 spec 工程都可以有自己的 `spec.config.js`：

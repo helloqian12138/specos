@@ -7,6 +7,13 @@ export function createLogger(verbose: boolean) {
       if (verbose) {
         console.warn(`warning: ${message}`);
       }
+    },
+    debug(enabled: boolean, label: string, payload: string) {
+      if (!enabled) {
+        return;
+      }
+
+      console.log(`\n[debug] ${label}\n${payload}\n`);
     }
   };
 }

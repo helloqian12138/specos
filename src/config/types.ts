@@ -33,5 +33,6 @@ export type ResolvedCompileConfig = {
   compile: {
     clean: boolean;
     verbose: boolean;
+    debug: boolean;
   };
 };

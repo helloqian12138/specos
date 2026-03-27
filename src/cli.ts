@@ -69,7 +69,7 @@ Usage:
   spec init --host <url> --auth <token> [--model <name>] [--dist <path>]
   spec init --config <file>
   spec init --project [dir]
-  spec compile <projectDir> [--outDir <path>] [--model <name>] [--host <url>]
+  spec compile <projectDir> [--outDir <path>] [--model <name>] [--host <url>] [--debug]
 
 Examples:
   spec init --host https://api.openai.com/v1 --auth sk-...
