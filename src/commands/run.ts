@@ -32,28 +32,35 @@ export async function runRunCommand(parsed: ParsedArgs): Promise<void> {
   const backendOnly = parsed.flags["backend-only"] === true;
   const install = parsed.flags.install === true;
   const dev = parsed.flags.dev === true || parsed.flags.watch === true;
+  const debug = parsed.flags.debug === true;
 
   if (frontendOnly && backendOnly) {
     throw new Error("run cannot use --frontend-only and --backend-only together");
   }
 
+  logRun("Resolving runnable targets", debug);
   const targets = await detectRunTargets(outDir, { frontendOnly, backendOnly });
   if (targets.length === 0) {
     throw new Error(`No runnable frontend or backend project found in ${outDir}`);
   }
+  logRun(`Detected targets: ${targets.join(", ")}`, true);
 
   if (install) {
-    await installDependencies(outDir, targets);
+    logRun("Installing dependencies before startup", true);
+    await installDependencies(outDir, targets, debug);
+    logRun("Dependency installation finished", true);
   }
 
+  logRun("Resolving runtime addresses", debug);
   const addresses = await resolveRuntimeAddresses(outDir, targets, dev);
   printRuntimeAddresses(addresses, targets, dev);
 
   if (targets.includes("backend")) {
-    await checkMongoConnectivity(addresses.mongoUri);
+    logRun("Checking MongoDB connectivity", true);
+    await checkMongoConnectivity(addresses.mongoUri, debug);
   }
 
-  await runTargets(outDir, targets, dev);
+  await runTargets(outDir, targets, dev, debug);
 }
 
 async function detectRunTargets(
@@ -77,26 +84,48 @@ async function detectRunTargets(
   return candidates;
 }
 
-async function installDependencies(outDir: string, targets: RunTarget[]): Promise<void> {
+async function installDependencies(
+  outDir: string,
+  targets: RunTarget[],
+  debug: boolean
+): Promise<void> {
   for (const target of targets) {
     if (target === "frontend") {
-      await runForegroundCommand("npm", ["install"], path.join(outDir, "frontend"), "frontend:install");
+      logRun("Starting frontend dependency install", true);
+      await runForegroundCommand(
+        "npm",
+        ["install"],
+        path.join(outDir, "frontend"),
+        "frontend:install",
+        debug,
+        { inheritOutput: true }
+      );
+      logRun("Frontend dependency install finished", true);
       continue;
     }
 
     const requirementsPath = path.join(outDir, "backend", "requirements.txt");
     if (await fileExists(requirementsPath)) {
+      logRun("Starting backend dependency install", true);
       await runForegroundCommand(
         "python3",
         ["-m", "pip", "install", "-r", "requirements.txt"],
         path.join(outDir, "backend"),
-        "backend:install"
+        "backend:install",
+        debug
       );
+      logRun("Backend dependency install finished", true);
     }
   }
 }
 
-async function runTargets(outDir: string, targets: RunTarget[], dev: boolean): Promise<void> {
+async function runTargets(
+  outDir: string,
+  targets: RunTarget[],
+  dev: boolean,
+  debug: boolean
+): Promise<void> {
+  logRun(`Starting runtime processes in ${dev ? "dev" : "run"} mode`, true);
   const running = targets.map(target => startTargetProcess(outDir, target, dev));
   const exitPromises = running.map(child => waitForExit(child));
 
@@ -110,7 +139,9 @@ async function runTargets(outDir: string, targets: RunTarget[], dev: boolean): P
   process.on("SIGTERM", forwardSignal);
 
   try {
+    logRun("Waiting for child processes", true);
     const firstExit = await waitForFirstExit(running, exitPromises);
+    logRun(`Process exited first with code ${firstExit.code}; shutting down others`, true);
     terminateOtherProcesses(running, firstExit.child);
     const remainingExitCodes = await Promise.all(exitPromises);
     const failed = [firstExit.code, ...remainingExitCodes].find(code => code !== 0);
@@ -118,6 +149,7 @@ async function runTargets(outDir: string, targets: RunTarget[], dev: boolean): P
       process.exitCode = failed;
     }
   } finally {
+    logRun("Run loop finished", debug);
     process.off("SIGINT", forwardSignal);
     process.off("SIGTERM", forwardSignal);
   }
@@ -125,6 +157,7 @@ async function runTargets(outDir: string, targets: RunTarget[], dev: boolean): P
 
 function startTargetProcess(outDir: string, target: RunTarget, dev: boolean): ChildProcess {
   if (target === "frontend") {
+    logRun(`Launching frontend with npm start in ${path.join(outDir, "frontend")}`, true);
     const child = spawn("npm", ["start"], {
       cwd: path.join(outDir, "frontend"),
       env: process.env,
@@ -135,6 +168,12 @@ function startTargetProcess(outDir: string, target: RunTarget, dev: boolean): Ch
   }
 
   const backendDir = path.join(outDir, "backend");
+  logRun(
+    `Launching backend with ${
+      dev ? "python3 -m flask --app app run --debug" : "python3 app.py"
+    } in ${backendDir}`,
+    true
+  );
   const child = spawn(
     "python3",
     dev
@@ -204,20 +243,28 @@ async function runForegroundCommand(
   command: string,
   args: string[],
   cwd: string,
-  label: string
+  label: string,
+  debug: boolean,
+  options: {
+    inheritOutput?: boolean;
+  } = {}
 ): Promise<void> {
   await new Promise<void>((resolve, reject) => {
+    logRun(`Running ${label}: ${command} ${args.join(" ")}`, true);
     const child = spawn(command, args, {
       cwd,
       env: process.env,
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: options.inheritOutput ? "inherit" : ["ignore", "pipe", "pipe"]
     });
 
-    attachPrefixedOutput(child, label);
+    if (!options.inheritOutput) {
+      attachPrefixedOutput(child, label);
+    }
 
     child.on("error", reject);
     child.on("exit", code => {
       if ((code ?? 0) === 0) {
+        logRun(`${label} completed successfully`, debug);
         resolve();
         return;
       }
@@ -308,7 +355,10 @@ function printRuntimeAddresses(
   }
 }
 
-async function checkMongoConnectivity(mongoUri: string | undefined): Promise<void> {
+async function checkMongoConnectivity(
+  mongoUri: string | undefined,
+  debug: boolean
+): Promise<void> {
   if (!mongoUri) {
     console.warn("warning: MongoDB URI not found. Skipping connectivity check.");
     return;
@@ -319,6 +369,8 @@ async function checkMongoConnectivity(mongoUri: string | undefined): Promise<voi
     console.warn("warning: Could not parse MongoDB host/port from URI. Skipping connectivity check.");
     return;
   }
+
+  logRun(`Testing MongoDB TCP connectivity to ${endpoint.host}:${endpoint.port}`, debug);
 
   await new Promise<void>((resolve, reject) => {
     const socket = net.createConnection(endpoint.port, endpoint.host);
@@ -345,6 +397,14 @@ async function checkMongoConnectivity(mongoUri: string | undefined): Promise<voi
       );
     });
   });
+}
+
+function logRun(message: string, enabled: boolean): void {
+  if (!enabled) {
+    return;
+  }
+
+  console.log(`[run] ${message}`);
 }
 
 function parseMongoEndpoint(
