@@ -1,0 +1,27 @@
+{
+  "name": "specos",
+  "version": "0.1.0",
+  "description": "Spec-driven AI compiler CLI for turning structured spec projects into runnable applications.",
+  "type": "module",
+  "bin": {
+    "spec": "./lib/index.js"
+  },
+  "files": [
+    "lib",
+    "examples",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,123 +1,138 @@
 # SpecOS
 
-> 输入自然语言，输出可运行系统。
+> 输入结构化 spec，输出可运行项目。
 
-SpecOS 想做的是这样一条链路：用户先用自然语言描述需求，系统把需求转换成 `todo.spec` 这样的结构化规格文件，用户可以继续手工修改这个 spec，最后再由运行时或编译层把 spec 变成一个真正可运行的系统。
+SpecOS 现在的 MVP 形态是一个基于 TypeScript 的 CLI 工具，用来把一个 spec 工程目录通过 AI 编译成可运行的项目骨架。
 
-当前仓库用 [`demo`](./demo) 目录里的 Todo 示例来说明这件事。
+当前版本特性：
 
-## 这个项目到底是什么
+- Node.js `>= 18`
+- npm 风格 CLI 包
+- 支持项目内 `spec.config.js`
+- 通过 `spec init` 初始化全局 API 配置
+- 通过 `spec compile <projectDir>` 执行 AI 编译
+- 固定目标技术栈：`React + Ant Design + TypeScript + Flask + MongoDB`
 
-SpecOS 不是“让 AI 一次性吐出代码”。
-
-它的核心模型是：
-
-1. 用户用自然语言表达想要的系统。
-2. 系统先生成一个结构化 spec。
-3. 用户可以直接检查和维护这个 spec。
-4. 系统再根据 spec 生成或驱动最终应用。
-
-也就是：
+## 产品模型
 
 ```text
-自然语言 -> 结构化系统描述 -> 可运行前后端系统
+spec 工程目录 -> AI compile -> 前后端可运行项目
 ```
 
-这里最重要的是中间这层 spec。它不是临时产物，而是用户意图和系统执行之间的正式契约。
+source of truth 是 spec 工程目录，不是 `dist` 里的生成代码。
 
-## 为什么一定要有 Spec 这一层
+## 命令
 
-自然语言足够灵活，但不够稳定。
-代码可以执行，但很难作为用户和系统之间长期维护的中间态。
+初始化全局 API 配置：
 
-SpecOS 的思路是把 spec 作为中间层，原因有三个：
+```bash
+spec init --host https://api.openai.com/v1 --auth sk-...
+```
 
-- LLM 容易生成
-- 人类容易阅读和修改
-- 运行时更容易做确定性执行
+或者从文件加载：
 
-所以 SpecOS 的目标不是：
+```bash
+spec init --config ./spec.global.json
+```
+
+初始化一个项目模板：
+
+```bash
+spec init --project ./examples/my-app
+```
+
+编译一个 spec 工程：
+
+```bash
+spec compile ./examples/todo-app
+```
+
+编译时覆盖输出目录或模型：
+
+```bash
+spec compile ./examples/todo-app --outDir ./dist --model gpt-4o-mini
+```
+
+## 项目配置
+
+每个 spec 工程都可以有自己的 `spec.config.js`：
+
+```js
+export default {
+  outDir: "./dist",
+  stack: {
+    frontend: "react",
+    ui: "antd",
+    language: "typescript",
+    backend: "flask",
+    database: "mongodb"
+  },
+  ai: {
+    model: "gpt-4o-mini",
+    temperature: 0.2
+  },
+  compile: {
+    clean: false,
+    verbose: true
+  }
+}
+```
+
+配置优先级：
 
 ```text
-需求 -> 一次性生成代码
+CLI 参数 > 项目 spec.config.js > 全局 spec init 配置
 ```
 
-而是：
+`auth` 应该保留在全局配置里，不建议放进项目目录。
+
+## 示例目录
 
 ```text
-需求 -> Spec -> 系统
+examples/todo-app/
+├── spec.config.js
+└── app.spec
 ```
 
-## 怎么理解
+MVP 当前会递归扫描目录中的 `.spec` 文件，并把它们合并成一个 AI compile 上下文。
 
-Todo 示例已经把这条链路拆成了三个部分：
+## 编译产物
 
-- [`demo/todo.spec`](/Users/lilingxia/WorkStation/specos/demo/todo.spec)：系统规格，描述实体、动作、页面、状态
-- [`demo/todo.jsx`](/Users/lilingxia/WorkStation/specos/demo/todo.jsx)：前端实现，对应 React + Ant Design
-- [`demo/todo.py`](/Users/lilingxia/WorkStation/specos/demo/todo.py)：后端实现，对应 Flask API
+生成文件会写入配置的 `outDir`。
 
-其中 `todo.spec` 不是注释，也不是伪文档，而是这个系统最重要的中间态。比如：
-
-```spec
-Action CompleteTodo:
-  API POST /api/v1/completeTodo
-
-  Input:
-    id
-
-  Do:
-    update Todo:
-      where id = input.id
-      set completed = true
-```
-
-这段 spec 已经明确表达了：
-
-- API 路径是什么
-- 输入是什么
-- 对哪一个实体做什么更新
-- 返回什么结果
-
-也就是说，用户未来既可以通过自然语言生成它，也可以直接手工修改它。
-
-## 用户心智
-
-一个完整流程应该是：
-
-1. 用户输入一句自然语言需求：
+同时会额外写入：
 
 ```text
-帮我做一个 Todo 管理系统，支持新增、搜索、完成，前端用 React + Ant Design，后端用 Flask。
+dist/.specos/
+├── compile-log.json
+├── file-manifest.json
+└── prompt-trace.json
 ```
 
-2. 系统生成 `todo.spec`
-3. 用户检查并修改 `todo.spec`
-4. 系统根据 `todo.spec` 生成或运行最终应用
+## 本地开发
 
-所以这个系统应该同时支持两种入口：
+安装依赖并构建：
 
-- 从自然语言开始
-- 从已有 spec 开始
+```bash
+npm install
+npm run build
+```
 
-## 设计原则
+本地运行编译后的 CLI：
 
-- Spec 是唯一事实来源
-- 自然语言只是输入方式，不是最终执行契约
-- 用户必须可以直接编辑 spec
-- 系统行为必须尽量从 spec 中读出来
-- spec 到系统的过程应该比自然语言到 spec 更确定
-
+```bash
+node ./lib/index.js compile ./examples/todo-app
+```
 
 ## 仓库结构
 
 ```text
 specos/
-├── demo/
-│   ├── todo.spec
-│   ├── todo.jsx
-│   └── todo.py
+├── examples/
+│   └── todo-app/
+├── src/
 ├── docs/
-│   └── ai-context.md
+├── demo/
 ├── README.md
 └── README.zh.md
 ```

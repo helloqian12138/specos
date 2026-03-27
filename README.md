@@ -1,138 +1,144 @@
 # SpecOS
 
-> Natural language in. Runnable system out.
+> Structured spec in. Runnable project out.
 
-SpecOS explores a development workflow where users describe a system in natural language, the system converts that intent into a structured spec, and the spec is then used to produce a runnable application.
+SpecOS is a TypeScript CLI for compiling a structured spec project into a runnable application skeleton with AI.
 
-This repository currently demonstrates that idea with a Todo example in the [`demo`](./demo) directory.
+Current MVP:
 
-## What This Project Is
+- Node.js `>= 18`
+- npm-style CLI package
+- project-local `spec.config.js`
+- global API initialization through `spec init`
+- AI compile pipeline through `spec compile <projectDir>`
+- target stack: `React + Ant Design + TypeScript + Flask + MongoDB`
 
-SpecOS is not just "AI generates code once".
+## Product Model
 
-The core idea is:
-
-1. The user describes the system in natural language.
-2. The system converts that description into a structured spec file.
-3. The user can review and edit the spec directly.
-4. The runtime/compiler layer uses the spec to produce a working system.
-
-In short:
+SpecOS is intentionally spec-driven:
 
 ```text
-Natural Language -> Spec -> runnable frontend + backend
+spec project -> AI compile -> runnable frontend + backend project
 ```
 
-That middle layer matters. The spec is the stable contract between user intent and system execution.
+The source of truth is the spec project directory, not the generated code in `dist`.
 
-## Why The Spec Layer Exists
+## Commands
 
-Natural language is flexible, but ambiguous.
-Code is executable, but expensive to inspect and regenerate safely.
-SpecOS uses a spec file as the editable, reviewable middle state.
+Initialize global API config:
 
-That gives you:
+```bash
+spec init --host https://api.openai.com/v1 --auth sk-...
+```
 
-- a format an LLM can generate
-- a format a human can inspect and refine
-- a format a runtime can execute deterministically
+Or load it from a file:
 
-So the real product model is:
+```bash
+spec init --config ./spec.global.json
+```
+
+Create a project template:
+
+```bash
+spec init --project ./examples/my-app
+```
+
+Compile a spec project:
+
+```bash
+spec compile ./examples/todo-app
+```
+
+Override output or model at compile time:
+
+```bash
+spec compile ./examples/todo-app --outDir ./dist --model gpt-4o-mini
+```
+
+## Project Config
+
+Each spec project can define its own `spec.config.js`:
+
+```js
+export default {
+  outDir: "./dist",
+  stack: {
+    frontend: "react",
+    ui: "antd",
+    language: "typescript",
+    backend: "flask",
+    database: "mongodb"
+  },
+  ai: {
+    model: "gpt-4o-mini",
+    temperature: 0.2
+  },
+  compile: {
+    clean: false,
+    verbose: true
+  }
+}
+```
+
+Config precedence:
 
 ```text
-Intent -> Spec -> System
+CLI flags > project spec.config.js > global spec init config
 ```
 
-not:
+`auth` should stay in the global config, not in project files.
+
+## Example Spec Project
 
 ```text
-Intent -> One-off generated code
+examples/todo-app/
+├── spec.config.js
+└── app.spec
 ```
 
-## Demo Flow
+The MVP scans `.spec` files recursively and sends the merged spec context to the model.
 
-The Todo demo shows the target workflow:
+## Compile Output
 
-- [`demo/todo.spec`](/Users/lilingxia/WorkStation/specos/demo/todo.spec): the structured system definition
-- [`demo/todo.jsx`](/Users/lilingxia/WorkStation/specos/demo/todo.jsx): generated or derived frontend implementation
-- [`demo/todo.py`](/Users/lilingxia/WorkStation/specos/demo/todo.py): generated or derived backend implementation
+Generated files are written into the configured `outDir`.
 
-The spec describes:
-
-- domain entities
-- actions and APIs
-- page structure
-- component behavior
-- state loading rules
-
-Example:
-
-```spec
-Action CreateTodo:
-  API POST /api/v1/createTodo
-
-  Input:
-    title
-
-  Do:
-    insert Todo:
-      title = input.title
-      completed = false
-```
-
-This is the key point: users do not have to edit React or Flask first. They can edit the spec first.
-
-## Desired User Experience
-
-A complete SpecOS loop should look like this:
-
-1. User input:
+SpecOS also writes metadata into:
 
 ```text
-Build a todo management system with search, create, and complete actions.
-Use React + Ant Design for the frontend and Flask for the backend.
+dist/.specos/
+├── compile-log.json
+├── file-manifest.json
+└── prompt-trace.json
 ```
 
-2. SpecOS generates `todo.spec`.
-3. The user adjusts the spec if needed.
-4. SpecOS builds or runs the application from the spec.
+## Local Development
 
-That means both of these are valid entry points:
+Install dependencies and build:
 
-- natural language from the user
-- direct edits to the spec by the user
+```bash
+npm install
+npm run build
+```
 
-## Design Principles
+Run the compiled CLI locally:
 
-- Spec is the source of truth.
-- Natural language is the input, not the runtime contract.
-- Users must be able to edit the spec directly.
-- System behavior should be readable from the spec.
-- Execution should be more deterministic than the natural-language step.
+```bash
+node ./lib/index.js compile ./examples/todo-app
+```
 
 ## Repository Layout
 
 ```text
 specos/
-├── demo/
-│   ├── todo.spec
-│   ├── todo.jsx
-│   └── todo.py
+├── examples/
+│   └── todo-app/
+├── src/
 ├── docs/
-│   └── ai-context.md
+├── demo/
 ├── README.md
 └── README.zh.md
 ```
 
-## Who This Is For
-
-SpecOS is for people exploring:
-
-- AI-native software development
-- spec-driven application generation
-- human-editable intermediate representations
-- systems where product intent should remain inspectable after generation
-
 ## Language
 
-English (default) · Chinese: [`README.zh.md`](/Users/lilingxia/WorkStation/specos/README.zh.md)
+English (default) · Chinese: [`README.zh.md`](./README.zh.md)

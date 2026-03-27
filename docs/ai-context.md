@@ -2,124 +2,105 @@
 
 ## Overview
 
-SpecOS is a project about building software from structured intent.
+SpecOS is currently implemented as a TypeScript CLI for compiling a structured spec project into a runnable full-stack project with AI.
 
-The target workflow is:
+The current workflow is:
 
 ```text
-Natural language -> spec file -> runnable system
+spec project directory -> AI compile -> dist project output
 ```
 
-In this repository, the spec is the most important intermediate artifact. A user may start with natural language, but the system should convert that input into a spec such as `todo.spec`. After that, the spec becomes the editable source of truth that can be reviewed, modified, validated, and turned into a working application.
-
-This means SpecOS should be understood as a spec-driven system, not just a code generator.
+The source of truth is the spec project directory, not the generated `dist` files.
 
 ## Current Repository State
 
-The repository is currently an early demo centered on a Todo example.
+The repository now contains an MVP CLI with these layers:
 
-Relevant files:
+- `src/commands/init.ts`: initializes global API config or creates a project template
+- `src/commands/compile.ts`: resolves config and starts the compile pipeline
+- `src/spec/loader.ts`: scans a spec project directory for `.spec` files
+- `src/ai/openai-client.ts`: calls an OpenAI-compatible HTTP API
+- `src/compiler/compile.ts`: runs the planning and generation stages
+- `src/emitter/project-emitter.ts`: writes generated files and compile metadata into `dist`
 
-- `demo/todo.spec`: the structured system definition
-- `demo/todo.jsx`: a frontend implementation derived from the spec
-- `demo/todo.py`: a backend implementation derived from the spec
+There is also a project example:
 
-These files together demonstrate the intended pipeline:
+- `examples/todo-app/spec.config.js`
+- `examples/todo-app/app.spec`
+
+The old `demo/` directory remains as historical context, but the active product shape is now the CLI + `examples/` project model.
+
+## Product Model
+
+SpecOS should be understood as a spec-driven AI compiler, not as a one-shot code generator.
+
+The working model is:
+
+1. The user prepares a spec project directory.
+2. The project may define compile behavior in `spec.config.js`.
+3. The user initializes global API credentials with `spec init`.
+4. The user runs `spec compile <projectDir>`.
+5. SpecOS sends the merged spec context to an OpenAI-compatible HTTP endpoint.
+6. SpecOS writes generated files into the configured `dist` directory.
+
+## Configuration Model
+
+Configuration is layered:
 
 ```text
-User intent -> Todo spec -> frontend/backend implementation
+CLI flags > project spec.config.js > global spec init config
 ```
 
-The repository does not yet contain a full parser, validator, or runtime engine. Those are implied future layers, not completed modules in the current codebase.
+Global config is intended for:
 
-## Core Product Idea
+- `host`
+- `auth`
+- `model`
+- `dist`
+- `timeout`
 
-SpecOS is built around the following model:
+Project config is intended for:
 
-1. The user describes a system in natural language.
-2. The system generates a structured spec.
-3. The user can directly edit the spec.
-4. The system produces a runnable application from the spec.
+- `outDir`
+- target stack
+- AI generation parameters
+- compile behavior like `clean` and `verbose`
 
-The spec layer exists because it solves three problems at once:
+Do not treat project config as the correct place for secrets unless that is explicitly intended by the user.
 
-- it is easier for LLMs to generate than correct production code
-- it is easier for humans to inspect and maintain than raw generated code
-- it provides a more stable contract for deterministic execution
+## Compile Scope In This MVP
 
-The most important project principle is:
+The MVP compile pipeline is intentionally narrow:
 
-```text
-Spec is the source of truth.
-```
+- input: recursive `.spec` files inside one project directory
+- planning: one streamed planning request to the model
+- generation: one JSON file-generation request to the model
+- output: generated frontend/backend files plus `.specos` metadata
 
-Natural language is only an input mechanism.
+The current fixed target stack is:
 
-## What A Spec Should Capture
-
-A SpecOS spec should describe the system at an application level, not just at a UI widget level.
-
-It should be able to express:
-
-- system goal or domain
-- entities and data shape
-- actions and API contracts
-- state and data-loading rules
-- pages, sections, and components
-- interaction behavior
-- environment choices such as frontend/backend stack when relevant
-
-From the Todo demo, examples of spec concepts include:
-
-- `Entity Todo`
-- `Action CreateTodo`
-- `Action SearchTodos`
-- `Action CompleteTodo`
-- `Page TodoPage (/todos)`
-- `Component CreateTodoModal`
-- `State.todos`
+- React
+- Ant Design
+- TypeScript
+- Python
+- Flask
+- MongoDB
 
 ## Mental Model For Codex
 
-When working in this repository, assume:
+When editing this repository, assume:
 
-- the spec is not documentation; it is the intended executable contract
-- frontend and backend implementations should stay aligned with the spec
-- changes should strengthen the pipeline from intent -> spec -> system
-- repository language should describe the project as spec-driven, not as a generic DSL experiment
-
-When adding or editing files, prefer changes that make the system easier to evolve in these stages:
-
-1. natural language understanding
-2. spec generation
-3. spec validation
-4. spec execution or compilation
-5. runnable app output
-
-## Design Principles
-
-- Spec is the single source of truth.
-- Users must be able to edit the spec directly.
-- The spec should be readable by both humans and models.
-- Behavior should be explicit in the spec instead of hidden in handwritten glue code.
-- The step from spec to runnable system should be more deterministic than the step from natural language to spec.
-- The system should preserve user intent in a structured, inspectable form.
+- the CLI package is the main product, not the old demo files
+- `examples/` should represent spec project inputs
+- `dist` is compile output, not source
+- compile should remain observable from the terminal
+- comments in code should stay focused on the non-obvious parts
+- the OpenAI HTTP integration should remain provider-compatible and not hard-code one vendor path beyond chat completions semantics
 
 ## Constraints
 
-- Do not treat the current repository as a finished framework.
-- Do not describe nonexistent modules as if they already exist.
-- Keep documentation aligned with the actual demo files in the repo.
-- Avoid framing SpecOS as only a UI renderer or only a code generator.
-- Prefer examples grounded in the Todo demo unless new examples are added.
-
-## Guidance For Future Implementation
-
-As the project evolves, the architecture will likely include:
-
-- parser: natural language -> spec
-- validator: spec syntax and semantic checks
-- compiler or runtime: spec -> runnable system
-- renderers or target generators for different stacks
-
-Until those layers exist, documentation and code should remain honest about the repository's current scope: a concrete demonstration of the spec-driven workflow, with `todo.spec` as the key intermediate state.
+- Keep the implementation honest about MVP scope.
+- Do not describe parser/validator/runtime subsystems as complete if they are not.
+- Prefer TypeScript with Node.js `>= 18`.
+- Keep the command model centered on `spec init` and `spec compile`.
+- Preserve the project-config-based workflow around `spec.config.js`.
