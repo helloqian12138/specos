@@ -12,6 +12,10 @@ type RuntimeAddresses = {
   backendUrl?: string;
   mongoUri?: string;
 };
+type RunningTarget = {
+  target: RunTarget;
+  child: ChildProcess;
+};
 
 export async function runRunCommand(parsed: ParsedArgs): Promise<void> {
   const projectInput = parsed.positionals[0];
@@ -126,12 +130,15 @@ async function runTargets(
   debug: boolean
 ): Promise<void> {
   logRun(`Starting runtime processes in ${dev ? "dev" : "run"} mode`, true);
-  const running = targets.map(target => startTargetProcess(outDir, target, dev));
-  const exitPromises = running.map(child => waitForExit(child));
+  const running = targets.map(target => ({
+    target,
+    child: startTargetProcess(outDir, target, dev)
+  }));
+  const exitPromises = running.map(entry => waitForExit(entry.child));
 
   const forwardSignal = (signal: NodeJS.Signals) => {
-    for (const child of running) {
-      child.kill(signal);
+    for (const entry of running) {
+      entry.child.kill(signal);
     }
   };
 
@@ -141,8 +148,11 @@ async function runTargets(
   try {
     logRun("Waiting for child processes", true);
     const firstExit = await waitForFirstExit(running, exitPromises);
-    logRun(`Process exited first with code ${firstExit.code}; shutting down others`, true);
-    terminateOtherProcesses(running, firstExit.child);
+    logRun(
+      `${firstExit.target} exited first with code ${firstExit.code}; shutting down others`,
+      true
+    );
+    terminateOtherProcesses(running, firstExit.child, debug);
     const remainingExitCodes = await Promise.all(exitPromises);
     const failed = [firstExit.code, ...remainingExitCodes].find(code => code !== 0);
     if (typeof failed === "number" && failed !== 0) {
@@ -220,22 +230,30 @@ function waitForExit(child: ChildProcess): Promise<number> {
 }
 
 function waitForFirstExit(
-  children: ChildProcess[],
+  running: RunningTarget[],
   exitPromises: Promise<number>[]
-): Promise<{ child: ChildProcess; code: number }> {
+): Promise<{ target: RunTarget; child: ChildProcess; code: number }> {
   return Promise.race(
-    children.map((child, index) =>
-      exitPromises[index].then(code => ({ child, code }))
+    running.map((entry, index) =>
+      exitPromises[index].then(code => ({ target: entry.target, child: entry.child, code }))
     )
   );
 }
 
-function terminateOtherProcesses(children: ChildProcess[], exitedChild: ChildProcess): void {
-  for (const child of children) {
-    if (child === exitedChild || child.killed) {
+function terminateOtherProcesses(
+  running: RunningTarget[],
+  exitedChild: ChildProcess,
+  debug: boolean
+): void {
+  for (const entry of running) {
+    if (entry.child === exitedChild || entry.child.killed) {
       continue;
     }
-    child.kill("SIGTERM");
+
+    logRun(`Stopping ${entry.target} after peer exit`, debug);
+
+    // SIGINT is gentler for dev servers than SIGTERM and tends to produce fewer noisy shutdown warnings.
+    entry.child.kill("SIGINT");
   }
 }
 

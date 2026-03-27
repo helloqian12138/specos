@@ -154,6 +154,26 @@ export async function compileSpecProject(
     );
   }
 
+  const artifactValidation = validateGeneratedArtifacts(files, targets);
+  for (const warning of artifactValidation.warnings) {
+    logger.warn(warning);
+    warnings.push(warning);
+  }
+
+  if (artifactValidation.errors.length > 0) {
+    await writeDebugFailureArtifacts({
+      outDir: config.outDir,
+      planMessages,
+      compilePlan,
+      generationMessagesByTarget: promptTraceByTarget,
+      generationTranscriptsByTarget: transcripts,
+      errorMessage: `Generated project is incomplete: ${artifactValidation.errors.join("; ")}`
+    });
+    throw new Error(
+      `Generated project is incomplete: ${artifactValidation.errors.join("; ")}`
+    );
+  }
+
   logger.step("5/5", `Finalizing compile output in ${config.outDir}`);
   await emitGeneratedProject({
     outDir: config.outDir,
@@ -342,10 +362,10 @@ ${specContext}`
 
 function getTargetInstructions(target: CompileTarget, config: ResolvedCompileConfig): string {
   if (target === "frontend") {
-    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit files under frontend/ only. Implement pages, components, API client calls, and frontend package configuration. Do not emit backend files or shared files.`;
+    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit files under frontend/ only. Implement a complete runnable frontend project, not just business components. Required minimum files include frontend/package.json, frontend/public/index.html, frontend/src/index.tsx or frontend/src/index.jsx, frontend/src/App.tsx or frontend/src/App.jsx, and any tsconfig/react env files needed by the chosen toolchain. Also implement pages, components, API client calls, and frontend package configuration. Do not emit backend files or shared files.`;
   }
 
-  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit files under backend/ only. Implement Flask app setup, routes, models, services, dependency files, and backend run instructions. Do not emit frontend files or shared files.`;
+  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit files under backend/ only. Implement a complete runnable backend project, including backend/app.py or equivalent entrypoint plus dependency files and environment guidance. Implement Flask app setup, routes, models, services, dependency files, and backend run instructions. Do not emit frontend files or shared files.`;
 }
 
 function detectCompileTargets(
@@ -449,4 +469,47 @@ async function writeDebugFailureArtifacts(input: {
 
 function getFileBlockProtocolDescription(): string {
   return "Each generated file must be emitted as `FILE: relative/path` followed by a fenced code block. Later blocks for the same path replace the previous file content.";
+}
+
+function validateGeneratedArtifacts(
+  files: GeneratedFile[],
+  targets: CompileTarget[]
+): { errors: string[]; warnings: string[] } {
+  const fileSet = new Set(files.map(file => file.path));
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (targets.includes("frontend")) {
+    const requiredFrontendGroups = [
+      ["frontend/package.json"],
+      ["frontend/public/index.html"],
+      ["frontend/src/App.tsx", "frontend/src/App.jsx"],
+      ["frontend/src/index.tsx", "frontend/src/index.jsx"]
+    ];
+
+    for (const group of requiredFrontendGroups) {
+      if (!group.some(candidate => fileSet.has(candidate))) {
+        errors.push(`frontend is missing required file: ${group.join(" or ")}`);
+      }
+    }
+
+    if (!fileSet.has("frontend/tsconfig.json")) {
+      warnings.push("frontend did not include tsconfig.json");
+    }
+  }
+
+  if (targets.includes("backend")) {
+    const requiredBackendGroups = [
+      ["backend/app.py"],
+      ["backend/requirements.txt"]
+    ];
+
+    for (const group of requiredBackendGroups) {
+      if (!group.some(candidate => fileSet.has(candidate))) {
+        errors.push(`backend is missing required file: ${group.join(" or ")}`);
+      }
+    }
+  }
+
+  return { errors, warnings };
 }
