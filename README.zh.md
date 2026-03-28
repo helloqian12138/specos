@@ -59,6 +59,8 @@ spec compile ./examples/todo-app --outDir ./dist --model gpt-4o-mini
 spec compile ./examples/todo-app --debug
 ```
 
+通过 `spec init --project` 创建的新项目会自带隐藏的 `.specos/` 脚手架。`frontend/package.json`、`frontend/index.html`、`frontend/tsconfig.json`、`frontend/vite.config.ts`、`backend/requirements.txt`、`.env.example` 这类运行时环境文件会基于这层脚手架产出，而不是继续让模型生成。需要补充前端依赖时，可以在 `app.spec` 的 `Environment -> Frontend` 中声明；后端和数据层依赖则通过 `Environment -> Backend` 和 `Environment -> Data` 扩展。
+
 运行已生成项目：
 
 ```bash

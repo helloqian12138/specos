@@ -2,6 +2,12 @@ import path from "node:path";
 import fs from "node:fs/promises";
 import { OpenAIClient } from "../ai/openai-client.js";
 import { ResolvedCompileConfig } from "../config/types.js";
+import {
+  inferNodePackageVersion,
+  listManagedScaffoldPaths,
+  loadManagedScaffoldFiles,
+  shouldUseDevDependency
+} from "./scaffold.js";
 import { emitGeneratedProject } from "../emitter/project-emitter.js";
 import { loadSpecProject } from "../spec/loader.js";
 import { ensureDirectory, writeJsonFile, writeTextFile } from "../utils/fs.js";
@@ -77,6 +83,12 @@ export async function compileSpecProject(
     throw new Error("No compile targets selected. Check the spec Environment or stack config.");
   }
 
+  const managedScaffoldFiles = await loadManagedScaffoldFiles(config.projectDir, project.promptContext);
+  const managedScaffoldPaths = new Set(listManagedScaffoldPaths());
+  for (const scaffoldFile of managedScaffoldFiles) {
+    await writeGeneratedFile(config.outDir, scaffoldFile);
+  }
+
   logger.step(
     "4/5",
     `Generating project files with ${targets.join(" + ")} agent(s)${
@@ -85,7 +97,9 @@ export async function compileSpecProject(
   );
   const transcripts: Partial<Record<CompileTarget, string>> = {};
   const promptTraceByTarget: Partial<Record<CompileTarget, ReturnType<typeof buildGenerationMessages>>> = {};
-  const filesMap = new Map<string, string>();
+  const filesMap = new Map<string, string>(
+    managedScaffoldFiles.map(file => [file.path, file.content])
+  );
   const generationTasks = targets.map(async target => {
     const targetState: StreamParseState = {
       buffer: "",
@@ -119,12 +133,25 @@ export async function compileSpecProject(
       },
       async chunk => {
         writeTargetChunk(target, chunk, targets.length > 1);
-        await consumeGenerationChunk(chunk, targetState, config, logger, target);
+        await consumeGenerationChunk(
+          chunk,
+          targetState,
+          config,
+          logger,
+          target,
+          managedScaffoldPaths
+        );
       }
     );
 
     process.stdout.write("\n");
-    await flushCompletedFileBlocks(targetState, config, logger, target);
+    await flushCompletedFileBlocks(
+      targetState,
+      config,
+      logger,
+      target,
+      managedScaffoldPaths
+    );
     transcripts[target] = targetState.transcript;
   });
 
@@ -198,6 +225,8 @@ export async function compileSpecProject(
       targets,
       project.promptContext
     ).errors
+      .filter(error => !managedScaffoldPaths.has(extractFilePathFromValidationError(error) ?? "")),
+    managedScaffoldPaths
   });
   const repairedFiles = repairResult.files;
   if (repairResult.appliedFixes > 0) {
@@ -289,18 +318,20 @@ async function consumeGenerationChunk(
   state: StreamParseState,
   config: ResolvedCompileConfig,
   logger: ReturnType<typeof createLogger>,
-  target: CompileTarget
+  target: CompileTarget,
+  managedScaffoldPaths: Set<string>
 ): Promise<void> {
   state.buffer += chunk;
   state.transcript += chunk;
-  await flushCompletedFileBlocks(state, config, logger, target);
+  await flushCompletedFileBlocks(state, config, logger, target, managedScaffoldPaths);
 }
 
 async function flushCompletedFileBlocks(
   state: StreamParseState,
   config: ResolvedCompileConfig,
   logger: ReturnType<typeof createLogger>,
-  target: CompileTarget
+  target: CompileTarget,
+  managedScaffoldPaths: Set<string>
 ): Promise<void> {
   while (true) {
     const match = matchNextCompletedFileBlock(state.buffer);
@@ -309,6 +340,12 @@ async function flushCompletedFileBlocks(
     }
 
     const generatedFile = normalizeGeneratedFile(match.path, match.content);
+    if (managedScaffoldPaths.has(generatedFile.path)) {
+      logger.step(`skip:${target}`, `${generatedFile.path} (compiler-managed scaffold)`);
+      state.buffer = state.buffer.slice(match.endIndex);
+      continue;
+    }
+
     state.files.set(generatedFile.path, generatedFile.content);
     await writeGeneratedFile(config.outDir, generatedFile);
     logger.step(`write:${target}`, generatedFile.path);
@@ -413,27 +450,11 @@ Target-specific requirements:
 ${targetInstructions}
 
 Output protocol:
-FILE: frontend/package.json
-\`\`\`json
-{
-  "name": "frontend"
+FILE: frontend/src/App.tsx
+\`\`\`tsx
+export function App() {
+  return <div>App</div>;
 }
-\`\`\`
-
-FILE: frontend/index.html
-\`\`\`html
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>App</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/index.tsx"></script>
-  </body>
-</html>
 \`\`\`
 
 Rules:
@@ -444,7 +465,7 @@ Rules:
 - Generate a minimal but coherent full-stack project.
 - If you are the frontend agent, only emit frontend or shared client-facing files.
 - If you are the backend agent, only emit backend or shared server-facing files.
-- Include package/dependency files needed to install and run the project.
+- Do not emit compiler-managed scaffold files such as frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, or root .env.example.
 - Prefer complete file replacements if you revise a file later in the stream.
 - The generated code must be runnable, not illustrative pseudocode.
 - Follow the spec exactly for route paths, field names, labels, validations, actions, and state wiring.
@@ -452,7 +473,6 @@ Rules:
 - Keep naming aligned across the stack. If the spec says \`name\`, \`age\`, \`sex\`, and \`city\`, those names must stay consistent in forms, API payloads, storage, and table rendering.
 - Frontend/backend integration must work in local development without browser CORS failures or broken base URLs.
 - Every imported third-party frontend package must be declared in frontend/package.json dependencies or devDependencies. Every imported third-party backend package must be declared in backend dependency files.
-- Shared environment, database, and deployment/runtime configuration templates should be emitted at the output root, for example \`.env.example\`, \`README.md\`, or root-level config templates, instead of being buried inside frontend/ or backend/ unless the framework requires that location.
 - Prefer boring, dependable framework patterns over clever abstractions.
 
 Spec project:
@@ -463,10 +483,10 @@ ${specContext}`
 
 function getTargetInstructions(target: CompileTarget, config: ResolvedCompileConfig): string {
   if (target === "frontend") {
-    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit files under frontend/ only, plus shared root-level config or documentation files when needed. Implement a complete runnable frontend project, not just business components. Required minimum files include frontend/package.json, frontend/index.html, frontend/src/index.tsx or frontend/src/index.jsx, frontend/src/App.tsx or frontend/src/App.jsx, and any tsconfig/react env files needed by the chosen toolchain. Also implement pages, components, API client calls, and frontend package configuration. Environment requirements: target modern Node 18+ compatibility; prefer Vite for React + TypeScript projects; avoid create-react-app, react-scripts 4, webpack 4, and deprecated toolchains that require OpenSSL legacy flags; when using Vite, place the HTML entry file at frontend/index.html and include the module script for /src/index.tsx instead of using create-react-app style frontend/public/index.html; include a runnable frontend script that works with \`spec run\`, preferably both \`start\` and \`dev\`, with the dev server bound to port 3000. Networking requirements: do not hardcode absolute browser API URLs such as \`http://localhost:5000\` in frontend code; call backend APIs through same-origin relative paths such as \`/api\` and configure the Vite dev server proxy to forward \`/api\` to the backend during local development. Shared configuration requirements: put cross-cutting environment and deployment templates such as \`.env.example\`, backend base URL examples, database connection examples, and local setup docs at the project root unless the framework requires a file under frontend/. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
+    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit business-facing frontend files under frontend/, especially frontend/src/. Implement a complete runnable frontend app, not just isolated components. The compiler already provides frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, and root .env.example; do not emit or replace those scaffold files. Also implement pages, components, API client calls, and route wiring. Environment requirements: target modern Node 18+ compatibility; assume a Vite + React + TypeScript scaffold already exists; do not switch toolchains. Networking requirements: do not hardcode absolute browser API URLs such as \`http://localhost:5000\` in frontend code; call backend APIs through same-origin relative paths such as \`/api\`. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
   }
 
-  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit files under backend/ only, plus shared root-level config or documentation files when needed. Implement a complete runnable backend project, including backend/app.py or equivalent entrypoint plus dependency files and environment guidance. Implement Flask app setup, routes, models, services, dependency files, and backend run instructions. Networking requirements: generated backend APIs should be compatible with a frontend dev server on http://localhost:3000; when appropriate, expose API routes under an /api prefix and include local-development CORS support such as Flask-Cors for http://localhost:3000 and http://127.0.0.1:3000 so browser requests are not blocked if the frontend is served separately. Shared configuration requirements: place database URIs, service ports, optional secrets, and deployment/runtime examples in root-level files such as \`.env.example\` or \`README.md\`, and keep backend/ focused on executable server code unless the framework requires local env files. Spec compliance requirements: action inputs, storage fields, validation rules, and response payloads must match the spec and stay consistent with the frontend-facing API contract. Do not emit frontend runtime code files.`;
+  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit executable backend code under backend/, such as backend/app.py, route modules, services, and models. Do not emit environment scaffold files. The compiler already provides backend/requirements.txt and root .env.example; do not emit or replace them. Networking requirements: generated backend APIs should be compatible with a frontend dev server on http://localhost:3000; when appropriate, expose API routes under an /api prefix and include local-development CORS support such as Flask-Cors for http://localhost:3000 and http://127.0.0.1:3000 so browser requests are not blocked if the frontend is served separately. Spec compliance requirements: action inputs, storage fields, validation rules, and response payloads must match the spec and stay consistent with the frontend-facing API contract. Do not emit frontend runtime code files.`;
 }
 
 function detectCompileTargets(
@@ -645,6 +665,7 @@ async function runAiStaticReviewAndRepair(input: {
   files: GeneratedFile[];
   outDir: string;
   initialValidationErrors: string[];
+  managedScaffoldPaths: Set<string>;
 }): Promise<RepairPassResult> {
   let currentFiles = input.files;
   let appliedFixes = 0;
@@ -718,6 +739,9 @@ async function runAiStaticReviewAndRepair(input: {
 
     const filesMap = new Map(currentFiles.map(file => [file.path, file.content]));
     for (const repairedFile of repairedFiles) {
+      if (input.managedScaffoldPaths.has(repairedFile.path)) {
+        continue;
+      }
       filesMap.set(repairedFile.path, repairedFile.content);
       await writeGeneratedFile(input.outDir, repairedFile);
     }
@@ -786,6 +810,7 @@ Rules:
 - Keep the project runnable after dependency installation.
 - Keep package manifests aligned with imported third-party modules.
 - If a required package is missing, update the appropriate package manifest automatically as part of the repair.
+- Do not modify compiler-managed scaffold files such as frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, or root .env.example.
 - Preserve the FILE + fenced code block protocol when returning fixes.
 - If all checks pass, return exactly OK and nothing else.
 - If checks fail, return only replacement FILE blocks for the files to fix and nothing else.
@@ -1050,6 +1075,23 @@ function isRootLevelEnvTemplate(filePath: string): boolean {
   );
 }
 
+function extractFilePathFromValidationError(error: string): string | undefined {
+  const patterns = [
+    /required file:\s*([^\s]+)/i,
+    /in\s+([^\s]+)$/i,
+    /in\s+([^\s;]+?)(?:;|$)/i
+  ];
+
+  for (const pattern of patterns) {
+    const match = error.match(pattern);
+    if (match?.[1]) {
+      return match[1];
+    }
+  }
+
+  return undefined;
+}
+
 function collectDeclaredNodePackages(packageJsonContent: string): Set<string> {
   if (!packageJsonContent.trim()) {
     return new Set();
@@ -1137,31 +1179,6 @@ function normalizePackageSpecifier(specifier: string): string | undefined {
 
   const [name] = specifier.split("/");
   return name || undefined;
-}
-
-function shouldUseDevDependency(packageName: string): boolean {
-  return (
-    packageName.startsWith("@types/") ||
-    packageName.startsWith("@vitejs/") ||
-    packageName === "vite"
-  );
-}
-
-function inferNodePackageVersion(packageName: string): string {
-  const pinnedVersions: Record<string, string> = {
-    react: "^18.0.0",
-    "react-dom": "^18.0.0",
-    "react-router-dom": "^6.0.0",
-    antd: "^4.16.13",
-    axios: "^0.21.1",
-    vite: "^2.6.4",
-    "@vitejs/plugin-react": "^1.3.2",
-    typescript: "^4.5.2",
-    "@types/react": "^17.0.38",
-    "@types/react-dom": "^17.0.11"
-  };
-
-  return pinnedVersions[packageName] ?? "*";
 }
 
 function sortRecordKeys(record: Record<string, string>): Record<string, string> {

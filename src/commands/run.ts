@@ -1,5 +1,6 @@
 import path from "node:path";
 import net from "node:net";
+import { existsSync } from "node:fs";
 import { ChildProcess, spawn } from "node:child_process";
 import { ParsedArgs } from "../cli.js";
 import { loadGlobalConfig } from "../config/global-config.js";
@@ -59,6 +60,11 @@ export async function runRunCommand(parsed: ParsedArgs): Promise<void> {
     throw new Error(`No runnable frontend or backend project found in ${outDir}`);
   }
   logRun(`Detected targets: ${targets.join(", ")}`, true);
+
+  if (!install && targets.includes("backend") && !(await backendVirtualEnvExists(outDir))) {
+    logRun("Backend virtual environment is missing; bootstrapping backend dependencies", true);
+    await installDependencies(outDir, ["backend"], debug);
+  }
 
   if (install) {
     logRun("Installing dependencies before startup", true);
@@ -121,17 +127,23 @@ async function installDependencies(
 
     const requirementsPath = path.join(outDir, "backend", "requirements.txt");
     if (await fileExists(requirementsPath)) {
+      const backendDir = path.join(outDir, "backend");
+      const pythonCommand = await ensureBackendVirtualEnv(backendDir, debug);
       logRun("Starting backend dependency install", true);
       await runForegroundCommand(
-        "python3",
+        pythonCommand,
         ["-m", "pip", "install", "-r", "requirements.txt"],
-        path.join(outDir, "backend"),
+        backendDir,
         "backend:install",
         debug
       );
       logRun("Backend dependency install finished", true);
     }
   }
+}
+
+async function backendVirtualEnvExists(outDir: string): Promise<boolean> {
+  return fileExists(path.join(outDir, "backend", ".venv", "bin", "python"));
 }
 
 async function runTargets(
@@ -199,14 +211,15 @@ function startTargetProcess(
   }
 
   const backendDir = path.join(outDir, "backend");
+  const backendPython = resolveBackendPythonCommand(backendDir);
   logRun(
     `Launching backend with ${
-      dev ? "python3 -m flask --app app run --debug" : "python3 app.py"
+      dev ? `${backendPython} -m flask --app app run --debug` : `${backendPython} app.py`
     } in ${backendDir}`,
     true
   );
   const child = spawn(
-    "python3",
+    backendPython,
     dev
       ? ["-m", "flask", "--app", "app", "run", "--debug"]
       : ["app.py"],
@@ -218,6 +231,28 @@ function startTargetProcess(
   );
   attachPrefixedOutput(child, "backend");
   return child;
+}
+
+async function ensureBackendVirtualEnv(backendDir: string, debug: boolean): Promise<string> {
+  const backendPython = resolveBackendPythonCommand(backendDir);
+  if (backendPython !== "python3") {
+    return backendPython;
+  }
+
+  logRun("Creating backend virtual environment in .venv", true);
+  await runForegroundCommand(
+    "python3",
+    ["-m", "venv", ".venv"],
+    backendDir,
+    "backend:venv",
+    debug
+  );
+  return resolveBackendPythonCommand(backendDir);
+}
+
+function resolveBackendPythonCommand(backendDir: string): string {
+  const virtualEnvPython = path.join(backendDir, ".venv", "bin", "python");
+  return existsSync(virtualEnvPython) ? virtualEnvPython : "python3";
 }
 
 function attachPrefixedOutput(

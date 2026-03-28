@@ -6,6 +6,7 @@ import {
   loadGlobalConfig,
   saveGlobalConfig
 } from "../config/global-config.js";
+import { writeDefaultProjectScaffoldFiles } from "../compiler/scaffold.js";
 import { ensureDirectory, fileExists, writeTextFile } from "../utils/fs.js";
 
 export async function runInitCommand(parsed: ParsedArgs): Promise<void> {
@@ -148,4 +149,6 @@ Environment:
 `
     );
   }
+
+  await writeDefaultProjectScaffoldFiles(targetDir);
 }
