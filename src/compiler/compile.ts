@@ -24,6 +24,13 @@ type StreamParseState = {
 };
 
 type CompileTarget = "frontend" | "backend";
+type RepairPassResult = {
+  files: GeneratedFile[];
+  appliedFixes: number;
+  transcript: string;
+  success: boolean;
+  failureReasons: string[];
+};
 
 export async function compileSpecProject(
   config: ResolvedCompileConfig
@@ -154,7 +161,7 @@ export async function compileSpecProject(
     );
   }
 
-  const artifactValidation = validateGeneratedArtifacts(files, targets);
+  const artifactValidation = validateGeneratedArtifacts(files, targets, project.promptContext);
   for (const warning of artifactValidation.warnings) {
     logger.warn(warning);
     warnings.push(warning);
@@ -174,16 +181,65 @@ export async function compileSpecProject(
     );
   }
 
-  logger.step("5/5", `Finalizing compile output in ${config.outDir}`);
+  logger.step("5/6", "Running AI static review and repair");
+  const repairResult = await runAiStaticReviewAndRepair({
+    client,
+    config,
+    logger,
+    targets,
+    specContext: project.promptContext,
+    compilePlan,
+    files,
+    outDir: config.outDir
+  });
+  const repairedFiles = repairResult.files;
+  if (repairResult.appliedFixes > 0) {
+    warnings.push(
+      `AI static review applied ${repairResult.appliedFixes} file fix${
+        repairResult.appliedFixes === 1 ? "" : "es"
+      }`
+    );
+  }
+
+  const repairedValidation = validateGeneratedArtifacts(
+    repairedFiles,
+    targets,
+    project.promptContext
+  );
+  for (const warning of repairedValidation.warnings) {
+    logger.warn(warning);
+    warnings.push(warning);
+  }
+
+  if (!repairResult.success || repairedValidation.errors.length > 0) {
+    const failureReasons = [
+      ...repairResult.failureReasons,
+      ...repairedValidation.errors
+    ];
+    const uniqueFailureReasons = Array.from(new Set(failureReasons));
+    await writeDebugFailureArtifacts({
+      outDir: config.outDir,
+      planMessages,
+      compilePlan,
+      generationMessagesByTarget: promptTraceByTarget,
+      generationTranscriptsByTarget: transcripts,
+      errorMessage: `Generated project failed after AI static review: ${uniqueFailureReasons.join("; ")}`
+    });
+    throw new Error(
+      `Compile failed after 3 AI static review passes: ${uniqueFailureReasons.join("; ")}`
+    );
+  }
+
+  logger.step("6/6", `Finalizing compile output in ${config.outDir}`);
   await emitGeneratedProject({
     outDir: config.outDir,
     clean: false,
-    files,
+    files: repairedFiles,
     metadata: {
       generatedAt: new Date().toISOString(),
       projectDir: config.projectDir,
       model: config.model,
-      summary: `Generated ${files.length} files from streamed code blocks.`,
+      summary: `Generated ${repairedFiles.length} files from streamed code blocks.`,
       warnings
     },
     promptTrace: {
@@ -192,12 +248,16 @@ export async function compileSpecProject(
       targets,
       generateByTarget: promptTraceByTarget,
       generationTranscriptsByTarget: transcripts,
+      staticReview: {
+        appliedFixes: repairResult.appliedFixes,
+        transcript: repairResult.transcript
+      },
       protocol: getFileBlockProtocolDescription()
     }
   });
 
   return {
-    files,
+    files: repairedFiles,
     warnings
   };
 }
@@ -280,7 +340,7 @@ function buildPlanMessages(specContext: string, config: ResolvedCompileConfig) {
     {
       role: "system" as const,
       content:
-        "You are the SpecOS planning agent. Explain how you will compile the spec into a React + Ant Design + TypeScript frontend and a Python + Flask + MongoDB backend. Keep the response concise, operational, and step-based."
+        "You are the SpecOS planning agent. The spec is the single source of truth. If the requested stack, routes, fields, validations, actions, or behavior in the spec conflict with any prior assumption, follow the spec exactly. Produce a concise, operational, step-based compile plan for a runnable project and explicitly cover frontend/backend integration, API contracts, entrypoints, routing, and local development behavior."
     },
     {
       role: "user" as const,
@@ -294,7 +354,14 @@ Database: ${config.stack.database}
 Spec project:
 ${specContext}
 
-Explain the compile plan and major files you will create.`
+Explain the compile plan and major files you will create.
+
+Planning rules:
+- Treat the spec as authoritative and do not invent entities, fields, routes, or actions.
+- Call out exact page routes, API endpoints, state sources, and validation rules you must implement.
+- Ensure the generated frontend and backend will run together locally after dependencies are installed.
+- Ensure the plan accounts for browser routing, API proxy/CORS, and frontend/backend data contract alignment.
+- Place shared environment, database, and deployment/runtime configuration templates at the generated project root, not inside frontend/ or backend/, unless a framework requires a local file.`
     }
   ];
 }
@@ -311,7 +378,7 @@ function buildGenerationMessages(
     {
       role: "system" as const,
       content:
-        `You are the SpecOS ${target} compile agent. Generate executable project files, not JSON. Stream the answer as code blocks only. Each file must start with \`FILE: relative/path\` on its own line, followed immediately by a fenced code block. You may emit the same file path again later with a more complete version; the compiler will treat the latest block as the current file content.`
+        `You are the SpecOS ${target} compile agent. The spec is the single source of truth. Generate executable project files, not JSON. Stream the answer as code blocks only. Each file must start with \`FILE: relative/path\` on its own line, followed immediately by a fenced code block. You may emit the same file path again later with a more complete version; the compiler will treat the latest block as the current file content. If the compile plan conflicts with the spec, obey the spec. Emit code that is runnable after dependency installation and keep the frontend/backend contract internally consistent.`
     },
     {
       role: "user" as const,
@@ -336,11 +403,20 @@ FILE: frontend/package.json
 }
 \`\`\`
 
-FILE: frontend/src/App.tsx
-\`\`\`tsx
-export default function App() {
-  return <div>Hello</div>;
-}
+FILE: frontend/index.html
+\`\`\`html
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>App</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.tsx"></script>
+  </body>
+</html>
 \`\`\`
 
 Rules:
@@ -353,6 +429,14 @@ Rules:
 - If you are the backend agent, only emit backend or shared server-facing files.
 - Include package/dependency files needed to install and run the project.
 - Prefer complete file replacements if you revise a file later in the stream.
+- The generated code must be runnable, not illustrative pseudocode.
+- Follow the spec exactly for route paths, field names, labels, validations, actions, and state wiring.
+- Do not invent extra pages, entities, fields, actions, or API shapes unless they are required by the chosen framework to make the project run.
+- Keep naming aligned across the stack. If the spec says \`name\`, \`age\`, \`sex\`, and \`city\`, those names must stay consistent in forms, API payloads, storage, and table rendering.
+- Frontend/backend integration must work in local development without browser CORS failures or broken base URLs.
+- Every imported third-party frontend package must be declared in frontend/package.json dependencies or devDependencies. Every imported third-party backend package must be declared in backend dependency files.
+- Shared environment, database, and deployment/runtime configuration templates should be emitted at the output root, for example \`.env.example\`, \`README.md\`, or root-level config templates, instead of being buried inside frontend/ or backend/ unless the framework requires that location.
+- Prefer boring, dependable framework patterns over clever abstractions.
 
 Spec project:
 ${specContext}`
@@ -362,10 +446,10 @@ ${specContext}`
 
 function getTargetInstructions(target: CompileTarget, config: ResolvedCompileConfig): string {
   if (target === "frontend") {
-    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit files under frontend/ only. Implement a complete runnable frontend project, not just business components. Required minimum files include frontend/package.json, frontend/public/index.html, frontend/src/index.tsx or frontend/src/index.jsx, frontend/src/App.tsx or frontend/src/App.jsx, and any tsconfig/react env files needed by the chosen toolchain. Also implement pages, components, API client calls, and frontend package configuration. Do not emit backend files or shared files.`;
+    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit files under frontend/ only, plus shared root-level config or documentation files when needed. Implement a complete runnable frontend project, not just business components. Required minimum files include frontend/package.json, frontend/index.html, frontend/src/index.tsx or frontend/src/index.jsx, frontend/src/App.tsx or frontend/src/App.jsx, and any tsconfig/react env files needed by the chosen toolchain. Also implement pages, components, API client calls, and frontend package configuration. Environment requirements: target modern Node 18+ compatibility; prefer Vite for React + TypeScript projects; avoid create-react-app, react-scripts 4, webpack 4, and deprecated toolchains that require OpenSSL legacy flags; when using Vite, place the HTML entry file at frontend/index.html and include the module script for /src/index.tsx instead of using create-react-app style frontend/public/index.html; include a runnable frontend script that works with \`spec run\`, preferably both \`start\` and \`dev\`, with the dev server bound to port 3000. Networking requirements: do not hardcode absolute browser API URLs such as \`http://localhost:5000\` in frontend code; call backend APIs through same-origin relative paths such as \`/api\` and configure the Vite dev server proxy to forward \`/api\` to the backend during local development. Shared configuration requirements: put cross-cutting environment and deployment templates such as \`.env.example\`, backend base URL examples, database connection examples, and local setup docs at the project root unless the framework requires a file under frontend/. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
   }
 
-  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit files under backend/ only. Implement a complete runnable backend project, including backend/app.py or equivalent entrypoint plus dependency files and environment guidance. Implement Flask app setup, routes, models, services, dependency files, and backend run instructions. Do not emit frontend files or shared files.`;
+  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit files under backend/ only, plus shared root-level config or documentation files when needed. Implement a complete runnable backend project, including backend/app.py or equivalent entrypoint plus dependency files and environment guidance. Implement Flask app setup, routes, models, services, dependency files, and backend run instructions. Networking requirements: generated backend APIs should be compatible with a frontend dev server on http://localhost:3000; when appropriate, expose API routes under an /api prefix and include local-development CORS support such as Flask-Cors for http://localhost:3000 and http://127.0.0.1:3000 so browser requests are not blocked if the frontend is served separately. Shared configuration requirements: place database URIs, service ports, optional secrets, and deployment/runtime examples in root-level files such as \`.env.example\` or \`README.md\`, and keep backend/ focused on executable server code unless the framework requires local env files. Spec compliance requirements: action inputs, storage fields, validation rules, and response payloads must match the spec and stay consistent with the frontend-facing API contract. Do not emit frontend runtime code files.`;
 }
 
 function detectCompileTargets(
@@ -471,18 +555,215 @@ function getFileBlockProtocolDescription(): string {
   return "Each generated file must be emitted as `FILE: relative/path` followed by a fenced code block. Later blocks for the same path replace the previous file content.";
 }
 
+async function runAiStaticReviewAndRepair(input: {
+  client: OpenAIClient;
+  config: ResolvedCompileConfig;
+  logger: ReturnType<typeof createLogger>;
+  targets: CompileTarget[];
+  specContext: string;
+  compilePlan: string;
+  files: GeneratedFile[];
+  outDir: string;
+}): Promise<RepairPassResult> {
+  let currentFiles = input.files;
+  let appliedFixes = 0;
+  let transcript = "";
+  const failureReasons: string[] = [];
+
+  for (let pass = 1; pass <= 3; pass += 1) {
+    input.logger.step("review", `AI static review pass ${pass}`);
+    const messages = buildStaticReviewMessages({
+      specContext: input.specContext,
+      compilePlan: input.compilePlan,
+      targets: input.targets,
+      files: currentFiles
+    });
+
+    const response = await input.client.createChatCompletion({
+      model: input.config.model,
+      temperature: 0,
+      messages
+    });
+    transcript += `\n\n=== pass ${pass} ===\n${response}`;
+
+    const normalizedResponse = response.trim();
+
+    if (normalizedResponse === "OK") {
+      const validation = validateGeneratedArtifacts(
+        currentFiles,
+        input.targets,
+        input.specContext
+      );
+      if (validation.errors.length > 0) {
+        failureReasons.push(
+          `AI review pass ${pass} returned OK but validation still failed: ${validation.errors.join("; ")}`
+        );
+        continue;
+      }
+
+      return {
+        files: currentFiles,
+        appliedFixes,
+        transcript: transcript.trim(),
+        success: true,
+        failureReasons
+      };
+    }
+
+    const repairedFiles = parseGeneratedFilesFromResponse(response);
+    if (repairedFiles.length === 0) {
+      failureReasons.push(
+        `AI review pass ${pass} returned neither OK nor parsable FILE blocks for repairs`
+      );
+      continue;
+    }
+
+    const filesMap = new Map(currentFiles.map(file => [file.path, file.content]));
+    for (const repairedFile of repairedFiles) {
+      filesMap.set(repairedFile.path, repairedFile.content);
+      await writeGeneratedFile(input.outDir, repairedFile);
+    }
+
+    currentFiles = Array.from(filesMap.entries()).map(([filePath, content]) => ({
+      path: filePath,
+      content
+    }));
+    appliedFixes += repairedFiles.length;
+
+    const validation = validateGeneratedArtifacts(
+      currentFiles,
+      input.targets,
+      input.specContext
+    );
+    if (validation.errors.length === 0) {
+      return {
+        files: currentFiles,
+        appliedFixes,
+        transcript: transcript.trim(),
+        success: true,
+        failureReasons
+      };
+    }
+
+    failureReasons.push(
+      `Validation errors after AI review pass ${pass}: ${validation.errors.join("; ")}`
+    );
+  }
+
+  return {
+    files: currentFiles,
+    appliedFixes,
+    transcript: transcript.trim(),
+    success: false,
+    failureReasons: Array.from(new Set(failureReasons))
+  };
+}
+
+function buildStaticReviewMessages(input: {
+  specContext: string;
+  compilePlan: string;
+  targets: CompileTarget[];
+  files: GeneratedFile[];
+}) {
+  return [
+    {
+      role: "system" as const,
+      content:
+        "You are the SpecOS static review and repair agent. Perform a static code review of the generated project against the spec and the generated stack. Focus on executable code that would fail to install, start, build, route, import, or integrate correctly. Also catch frontend/backend contract mismatches, missing dependencies, wrong entrypoints, broken routing defaults, API base URL mistakes, and violations of the spec. Root-level shared configuration templates and setup docs such as .env.example, README.md, and deployment notes are not local static validation targets unless they clearly contradict the executable code or spec. You must always return one of exactly two outcomes: 1. return exactly OK when the project fully passes static review, or 2. return only full replacement FILE blocks for every file that must change. Do not return an empty response. Do not include prose, markdown lists, JSON, or explanations."
+    },
+    {
+      role: "user" as const,
+      content: `Statically review this generated project and repair any incorrect files.
+
+Targets:
+${input.targets.join(", ")}
+
+Compile plan:
+${input.compilePlan.trim() || "(empty plan output)"}
+
+Rules:
+- The spec is the source of truth.
+- Fix only files that are actually wrong.
+- Keep the project runnable after dependency installation.
+- Keep package manifests aligned with imported third-party modules.
+- Preserve the FILE + fenced code block protocol when returning fixes.
+- If all checks pass, return exactly OK and nothing else.
+- If checks fail, return only replacement FILE blocks for the files to fix and nothing else.
+- Never return an empty response.
+
+Spec project:
+${input.specContext}
+
+Generated files:
+${serializeGeneratedFiles(input.files)}`
+    }
+  ];
+}
+
+function serializeGeneratedFiles(files: GeneratedFile[]): string {
+  return files
+    .map(file => {
+      const language = detectFenceLanguage(file.path);
+      return `FILE: ${file.path}\n\`\`\`${language}\n${file.content.replace(/\s+$/, "")}\n\`\`\``;
+    })
+    .join("\n\n");
+}
+
+function detectFenceLanguage(filePath: string): string {
+  const extension = path.extname(filePath).toLowerCase();
+  switch (extension) {
+    case ".ts":
+      return "ts";
+    case ".tsx":
+      return "tsx";
+    case ".js":
+      return "js";
+    case ".jsx":
+      return "jsx";
+    case ".json":
+      return "json";
+    case ".py":
+      return "py";
+    case ".html":
+      return "html";
+    case ".css":
+      return "css";
+    default:
+      return "";
+  }
+}
+
+function parseGeneratedFilesFromResponse(response: string): GeneratedFile[] {
+  const files: GeneratedFile[] = [];
+  let buffer = response;
+
+  while (true) {
+    const match = matchNextCompletedFileBlock(buffer);
+    if (!match) {
+      break;
+    }
+
+    files.push(normalizeGeneratedFile(match.path, match.content));
+    buffer = buffer.slice(match.endIndex);
+  }
+
+  return files;
+}
+
 function validateGeneratedArtifacts(
   files: GeneratedFile[],
-  targets: CompileTarget[]
+  targets: CompileTarget[],
+  specContext: string
 ): { errors: string[]; warnings: string[] } {
   const fileSet = new Set(files.map(file => file.path));
+  const fileMap = new Map(files.map(file => [file.path, file.content]));
   const errors: string[] = [];
   const warnings: string[] = [];
 
   if (targets.includes("frontend")) {
     const requiredFrontendGroups = [
       ["frontend/package.json"],
-      ["frontend/public/index.html"],
+      ["frontend/index.html"],
       ["frontend/src/App.tsx", "frontend/src/App.jsx"],
       ["frontend/src/index.tsx", "frontend/src/index.jsx"]
     ];
@@ -495,6 +776,50 @@ function validateGeneratedArtifacts(
 
     if (!fileSet.has("frontend/tsconfig.json")) {
       warnings.push("frontend did not include tsconfig.json");
+    }
+
+    const packageJson = fileMap.get("frontend/package.json") ?? "";
+    const usesVite = /"vite"\s*:/.test(packageJson);
+    if (usesVite && !fileSet.has("frontend/vite.config.ts") && !fileSet.has("frontend/vite.config.js")) {
+      warnings.push("frontend uses Vite but did not include vite.config.ts or vite.config.js");
+    }
+
+    const declaredPackages = collectDeclaredNodePackages(packageJson);
+    const importedPackages = collectImportedNodePackages(
+      files.filter(file => file.path.startsWith("frontend/"))
+    );
+    for (const pkg of importedPackages) {
+      if (!declaredPackages.has(pkg)) {
+        errors.push(`frontend imports "${pkg}" but frontend/package.json does not declare it`);
+      }
+    }
+
+    for (const file of files.filter(isBrowserRuntimeFrontendFile)) {
+      if (/https?:\/\/localhost:\d+/i.test(file.content)) {
+        errors.push(`frontend hardcodes a localhost URL in ${file.path}; use relative /api paths instead`);
+      }
+    }
+
+    const appContent =
+      fileMap.get("frontend/src/App.tsx") ??
+      fileMap.get("frontend/src/App.jsx") ??
+      "";
+    const specPageRoutes = Array.from(specContext.matchAll(/Page\s+\w+\s*\((\/[^)\s]+)\)/g)).map(
+      match => match[1]
+    );
+    if (specPageRoutes.length > 0 && !/path\s*=\s*["']\/["']/.test(appContent)) {
+      warnings.push("frontend App is missing an explicit root route even though the spec defines page paths");
+    }
+
+    const usesApiPaths = files.some(
+      file => file.path.startsWith("frontend/") && /['"`]\/api(?:\/|['"`])/.test(file.content)
+    );
+    const viteConfig =
+      fileMap.get("frontend/vite.config.ts") ??
+      fileMap.get("frontend/vite.config.js") ??
+      "";
+    if (usesApiPaths && viteConfig.length > 0 && !/proxy\s*:\s*\{[\s\S]*\/api/.test(viteConfig)) {
+      warnings.push("frontend uses /api paths but vite.config does not appear to proxy /api for local development");
     }
   }
 
@@ -509,7 +834,126 @@ function validateGeneratedArtifacts(
         errors.push(`backend is missing required file: ${group.join(" or ")}`);
       }
     }
+
+    const backendApp = fileMap.get("backend/app.py") ?? "";
+    const requirements = fileMap.get("backend/requirements.txt") ?? "";
+    if (/CORS\s*\(/.test(backendApp) && !/Flask-Cors/i.test(requirements)) {
+      errors.push("backend uses CORS but requirements.txt does not include Flask-Cors");
+    }
+
+    const frontendUsesApiPaths = files.some(
+      file => file.path.startsWith("frontend/") && /['"`]\/api(?:\/|['"`])/.test(file.content)
+    );
+    if (targets.includes("frontend") && frontendUsesApiPaths) {
+      if (!/url_prefix\s*=\s*["']\/api["']/.test(backendApp)) {
+        warnings.push("frontend calls /api paths but backend/app.py does not appear to register routes under /api");
+      }
+      if (!/CORS\s*\(/.test(backendApp)) {
+        warnings.push("backend does not appear to enable CORS for local development");
+      }
+    }
+
+    if (!files.some(file => isRootLevelEnvTemplate(file.path))) {
+      warnings.push(
+        "generated project did not include a root-level environment template such as .env.example"
+      );
+    }
   }
 
   return { errors, warnings };
+}
+
+function isRootLevelEnvTemplate(filePath: string): boolean {
+  return /^(?:\.env(?:\.[^.\/]+)?|README(?:\.[^.\/]+)?|docker-compose\.yml|docker-compose\.yaml)$/i.test(
+    filePath
+  );
+}
+
+function collectDeclaredNodePackages(packageJsonContent: string): Set<string> {
+  if (!packageJsonContent.trim()) {
+    return new Set();
+  }
+
+  try {
+    const manifest = JSON.parse(packageJsonContent) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+      peerDependencies?: Record<string, string>;
+    };
+
+    return new Set([
+      ...Object.keys(manifest.dependencies ?? {}),
+      ...Object.keys(manifest.devDependencies ?? {}),
+      ...Object.keys(manifest.peerDependencies ?? {})
+    ]);
+  } catch {
+    return new Set();
+  }
+}
+
+function collectImportedNodePackages(files: GeneratedFile[]): Set<string> {
+  const packages = new Set<string>();
+
+  for (const file of files) {
+    for (const specifier of extractModuleSpecifiers(file.content)) {
+      const packageName = normalizePackageSpecifier(specifier);
+      if (packageName) {
+        packages.add(packageName);
+      }
+    }
+  }
+
+  return packages;
+}
+
+function isBrowserRuntimeFrontendFile(file: GeneratedFile): boolean {
+  if (!file.path.startsWith("frontend/")) {
+    return false;
+  }
+
+  if (!/^frontend\/src\/.+\.(ts|tsx|js|jsx)$/.test(file.path)) {
+    return false;
+  }
+
+  return true;
+}
+
+function extractModuleSpecifiers(content: string): string[] {
+  const specifiers: string[] = [];
+  const patterns = [
+    /\bimport\s+(?:type\s+)?(?:[^"'`]+?\s+from\s+)?["'`]([^"'`]+)["'`]/g,
+    /\bexport\s+[^"'`]+?\s+from\s+["'`]([^"'`]+)["'`]/g,
+    /\brequire\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      const specifier = match[1]?.trim();
+      if (specifier) {
+        specifiers.push(specifier);
+      }
+    }
+  }
+
+  return specifiers;
+}
+
+function normalizePackageSpecifier(specifier: string): string | undefined {
+  if (
+    specifier.startsWith(".") ||
+    specifier.startsWith("/") ||
+    specifier.startsWith("http://") ||
+    specifier.startsWith("https://") ||
+    specifier.startsWith("node:")
+  ) {
+    return undefined;
+  }
+
+  if (specifier.startsWith("@")) {
+    const [scope, name] = specifier.split("/");
+    return scope && name ? `${scope}/${name}` : undefined;
+  }
+
+  const [name] = specifier.split("/");
+  return name || undefined;
 }

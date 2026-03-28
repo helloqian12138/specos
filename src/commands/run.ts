@@ -17,6 +17,17 @@ type RunningTarget = {
   child: ChildProcess;
 };
 
+type FrontendRuntimeConfig = {
+  args: string[];
+  env: NodeJS.ProcessEnv;
+};
+
+type PackageManifest = {
+  scripts?: Record<string, string>;
+  dependencies?: Record<string, string>;
+  devDependencies?: Record<string, string>;
+};
+
 export async function runRunCommand(parsed: ParsedArgs): Promise<void> {
   const projectInput = parsed.positionals[0];
 
@@ -130,9 +141,12 @@ async function runTargets(
   debug: boolean
 ): Promise<void> {
   logRun(`Starting runtime processes in ${dev ? "dev" : "run"} mode`, true);
+  const frontendRuntime = targets.includes("frontend")
+    ? await resolveFrontendRuntimeConfig(path.join(outDir, "frontend"))
+    : undefined;
   const running = targets.map(target => ({
     target,
-    child: startTargetProcess(outDir, target, dev)
+    child: startTargetProcess(outDir, target, dev, frontendRuntime)
   }));
   const exitPromises = running.map(entry => waitForExit(entry.child));
 
@@ -165,12 +179,19 @@ async function runTargets(
   }
 }
 
-function startTargetProcess(outDir: string, target: RunTarget, dev: boolean): ChildProcess {
+function startTargetProcess(
+  outDir: string,
+  target: RunTarget,
+  dev: boolean,
+  frontendRuntime?: FrontendRuntimeConfig
+): ChildProcess {
   if (target === "frontend") {
-    logRun(`Launching frontend with npm start in ${path.join(outDir, "frontend")}`, true);
-    const child = spawn("npm", ["start"], {
+    const frontendDir = path.join(outDir, "frontend");
+    const runtime = frontendRuntime ?? { args: ["start"], env: process.env };
+    logRun(`Launching frontend with npm ${runtime.args.join(" ")} in ${frontendDir}`, true);
+    const child = spawn("npm", runtime.args, {
       cwd: path.join(outDir, "frontend"),
-      env: process.env,
+      env: runtime.env,
       stdio: ["ignore", "pipe", "pipe"]
     });
     attachPrefixedOutput(child, "frontend");
@@ -238,6 +259,75 @@ function waitForFirstExit(
       exitPromises[index].then(code => ({ target: entry.target, child: entry.child, code }))
     )
   );
+}
+
+async function resolveFrontendRuntimeConfig(frontendDir: string): Promise<FrontendRuntimeConfig> {
+  const manifest = await readPackageManifest(path.join(frontendDir, "package.json"));
+  const scripts = manifest.scripts ?? {};
+  const env = buildFrontendRuntimeEnv(manifest);
+
+  if (typeof scripts.start === "string" && scripts.start.trim().length > 0) {
+    return {
+      args: ["start"],
+      env
+    };
+  }
+
+  if (typeof scripts.dev === "string" && scripts.dev.trim().length > 0) {
+    return {
+      args: ["run", "dev", "--", "--host", "0.0.0.0", "--port", "3000"],
+      env
+    };
+  }
+
+  throw new Error(
+    `frontend package is missing a runnable script. Expected "start" or "dev" in ${path.join(frontendDir, "package.json")}`
+  );
+}
+
+async function readPackageManifest(packageJsonPath: string): Promise<PackageManifest> {
+  const content = await readTextFile(packageJsonPath);
+  return JSON.parse(content) as PackageManifest;
+}
+
+function buildFrontendRuntimeEnv(manifest: PackageManifest): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+
+  if (!requiresLegacyOpenSsl(manifest)) {
+    return env;
+  }
+
+  const current = env.NODE_OPTIONS?.trim();
+  if (current?.includes("--openssl-legacy-provider")) {
+    return env;
+  }
+
+  env.NODE_OPTIONS = current ? `${current} --openssl-legacy-provider` : "--openssl-legacy-provider";
+  return env;
+}
+
+function requiresLegacyOpenSsl(manifest: PackageManifest): boolean {
+  const dependencies = {
+    ...manifest.dependencies,
+    ...manifest.devDependencies
+  };
+
+  const reactScriptsVersion = dependencies["react-scripts"];
+  if (reactScriptsVersion && getMajorVersion(reactScriptsVersion) < 5) {
+    return true;
+  }
+
+  const webpackVersion = dependencies.webpack;
+  if (webpackVersion && getMajorVersion(webpackVersion) < 5) {
+    return true;
+  }
+
+  return false;
+}
+
+function getMajorVersion(versionRange: string): number {
+  const match = versionRange.match(/(\d+)/);
+  return match ? Number(match[1]) : Number.POSITIVE_INFINITY;
 }
 
 function terminateOtherProcesses(
