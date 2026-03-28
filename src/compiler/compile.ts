@@ -167,21 +167,23 @@ export async function compileSpecProject(
     warnings.push(warning);
   }
 
-  if (artifactValidation.errors.length > 0) {
-    await writeDebugFailureArtifacts({
-      outDir: config.outDir,
-      planMessages,
-      compilePlan,
-      generationMessagesByTarget: promptTraceByTarget,
-      generationTranscriptsByTarget: transcripts,
-      errorMessage: `Generated project is incomplete: ${artifactValidation.errors.join("; ")}`
-    });
-    throw new Error(
-      `Generated project is incomplete: ${artifactValidation.errors.join("; ")}`
+  logger.step("5/6", "Running AI static review and repair");
+  const deterministicRepair = await applyDeterministicRepairs({
+    files,
+    targets,
+    outDir: config.outDir,
+    logger,
+    debug: config.compile.debug
+  });
+  const filesForReview = deterministicRepair.files;
+  if (deterministicRepair.appliedFixes > 0) {
+    warnings.push(
+      `Deterministic static repair applied ${deterministicRepair.appliedFixes} file fix${
+        deterministicRepair.appliedFixes === 1 ? "" : "es"
+      }`
     );
   }
 
-  logger.step("5/6", "Running AI static review and repair");
   const repairResult = await runAiStaticReviewAndRepair({
     client,
     config,
@@ -189,8 +191,13 @@ export async function compileSpecProject(
     targets,
     specContext: project.promptContext,
     compilePlan,
-    files,
-    outDir: config.outDir
+    files: filesForReview,
+    outDir: config.outDir,
+    initialValidationErrors: validateGeneratedArtifacts(
+      filesForReview,
+      targets,
+      project.promptContext
+    ).errors
   });
   const repairedFiles = repairResult.files;
   if (repairResult.appliedFixes > 0) {
@@ -317,20 +324,30 @@ function matchNextCompletedFileBlock(input: string):
       endIndex: number;
     }
   | undefined {
-  const fileHeaderMatch = /FILE:\s*([^\n]+)\n```([a-zA-Z0-9._+-]*)?\n/.exec(input);
+  const normalizedInput = input.replace(/\r\n/g, "\n");
+  const fileHeaderMatch = /FILE:\s*([^\n]+)\n```([a-zA-Z0-9._+-]*)?\n/.exec(normalizedInput);
   if (!fileHeaderMatch || fileHeaderMatch.index === undefined) {
     return undefined;
   }
 
   const contentStart = fileHeaderMatch.index + fileHeaderMatch[0].length;
-  const fenceEndIndex = input.indexOf("\n```", contentStart);
+  const fenceEndIndex = normalizedInput.indexOf("\n```", contentStart);
   if (fenceEndIndex === -1) {
-    return undefined;
+    const eofFenceIndex = normalizedInput.indexOf("```", contentStart);
+    if (eofFenceIndex === -1) {
+      return undefined;
+    }
+
+    return {
+      path: fileHeaderMatch[1].trim(),
+      content: normalizedInput.slice(contentStart, eofFenceIndex),
+      endIndex: eofFenceIndex + "```".length
+    };
   }
 
   return {
     path: fileHeaderMatch[1].trim(),
-    content: input.slice(contentStart, fenceEndIndex),
+    content: normalizedInput.slice(contentStart, fenceEndIndex),
     endIndex: fenceEndIndex + "\n```".length
   };
 }
@@ -555,6 +572,69 @@ function getFileBlockProtocolDescription(): string {
   return "Each generated file must be emitted as `FILE: relative/path` followed by a fenced code block. Later blocks for the same path replace the previous file content.";
 }
 
+async function applyDeterministicRepairs(input: {
+  files: GeneratedFile[];
+  targets: CompileTarget[];
+  outDir: string;
+  logger: ReturnType<typeof createLogger>;
+  debug: boolean;
+}): Promise<{ files: GeneratedFile[]; appliedFixes: number }> {
+  const filesMap = new Map(input.files.map(file => [file.path, file.content]));
+  let appliedFixes = 0;
+
+  if (input.targets.includes("frontend")) {
+    const packageJsonPath = "frontend/package.json";
+    const packageJsonContent = filesMap.get(packageJsonPath);
+    if (packageJsonContent) {
+      const nextPackageJson = repairFrontendPackageManifest(
+        packageJsonContent,
+        input.files.filter(file => file.path.startsWith("frontend/"))
+      );
+      if (nextPackageJson && nextPackageJson !== packageJsonContent) {
+        filesMap.set(packageJsonPath, nextPackageJson);
+        await writeGeneratedFile(input.outDir, {
+          path: packageJsonPath,
+          content: nextPackageJson
+        });
+        appliedFixes += 1;
+        input.logger.debug(
+          input.debug,
+          "deterministic repair frontend/package.json",
+          nextPackageJson
+        );
+      }
+    }
+  }
+
+  if (input.targets.includes("backend")) {
+    const appPy = filesMap.get("backend/app.py") ?? "";
+    const requirementsPath = "backend/requirements.txt";
+    const requirementsContent = filesMap.get(requirementsPath);
+    if (requirementsContent && /CORS\s*\(/.test(appPy) && !/Flask-Cors/i.test(requirementsContent)) {
+      const nextRequirements = `${requirementsContent.replace(/\s+$/, "")}\nFlask-Cors\n`;
+      filesMap.set(requirementsPath, nextRequirements);
+      await writeGeneratedFile(input.outDir, {
+        path: requirementsPath,
+        content: nextRequirements
+      });
+      appliedFixes += 1;
+      input.logger.debug(
+        input.debug,
+        "deterministic repair backend/requirements.txt",
+        nextRequirements
+      );
+    }
+  }
+
+  return {
+    files: Array.from(filesMap.entries()).map(([filePath, content]) => ({
+      path: filePath,
+      content
+    })),
+    appliedFixes
+  };
+}
+
 async function runAiStaticReviewAndRepair(input: {
   client: OpenAIClient;
   config: ResolvedCompileConfig;
@@ -564,6 +644,7 @@ async function runAiStaticReviewAndRepair(input: {
   compilePlan: string;
   files: GeneratedFile[];
   outDir: string;
+  initialValidationErrors: string[];
 }): Promise<RepairPassResult> {
   let currentFiles = input.files;
   let appliedFixes = 0;
@@ -576,15 +657,27 @@ async function runAiStaticReviewAndRepair(input: {
       specContext: input.specContext,
       compilePlan: input.compilePlan,
       targets: input.targets,
-      files: currentFiles
+      files: currentFiles,
+      initialValidationErrors: pass === 1 ? input.initialValidationErrors : []
     });
 
-    const response = await input.client.createChatCompletion({
-      model: input.config.model,
-      temperature: 0,
-      messages
-    });
+    let response = "";
+    await input.client.streamChatCompletion(
+      {
+        model: input.config.model,
+        temperature: 0,
+        messages
+      },
+      chunk => {
+        response += chunk;
+      }
+    );
     transcript += `\n\n=== pass ${pass} ===\n${response}`;
+    input.logger.debug(
+      input.config.compile.debug,
+      `static review pass ${pass} raw response`,
+      truncateForDebug(response)
+    );
 
     const normalizedResponse = response.trim();
 
@@ -611,6 +704,11 @@ async function runAiStaticReviewAndRepair(input: {
     }
 
     const repairedFiles = parseGeneratedFilesFromResponse(response);
+    input.logger.debug(
+      input.config.compile.debug,
+      `static review pass ${pass} parsed files`,
+      JSON.stringify(repairedFiles.map(file => file.path), null, 2)
+    );
     if (repairedFiles.length === 0) {
       failureReasons.push(
         `AI review pass ${pass} returned neither OK nor parsable FILE blocks for repairs`
@@ -664,6 +762,7 @@ function buildStaticReviewMessages(input: {
   compilePlan: string;
   targets: CompileTarget[];
   files: GeneratedFile[];
+  initialValidationErrors: string[];
 }) {
   return [
     {
@@ -686,10 +785,15 @@ Rules:
 - Fix only files that are actually wrong.
 - Keep the project runnable after dependency installation.
 - Keep package manifests aligned with imported third-party modules.
+- If a required package is missing, update the appropriate package manifest automatically as part of the repair.
 - Preserve the FILE + fenced code block protocol when returning fixes.
 - If all checks pass, return exactly OK and nothing else.
 - If checks fail, return only replacement FILE blocks for the files to fix and nothing else.
 - Never return an empty response.
+- Do not wrap \`FILE:\` lines inside an outer markdown code fence such as \`\`\`FILE: path.
+
+Known validation errors from the compiler:
+${input.initialValidationErrors.length > 0 ? input.initialValidationErrors.map(error => `- ${error}`).join("\n") : "- none"}
 
 Spec project:
 ${input.specContext}
@@ -698,6 +802,48 @@ Generated files:
 ${serializeGeneratedFiles(input.files)}`
     }
   ];
+}
+
+function repairFrontendPackageManifest(
+  packageJsonContent: string,
+  frontendFiles: GeneratedFile[]
+): string | undefined {
+  try {
+    const manifest = JSON.parse(packageJsonContent) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+
+    const dependencies = { ...(manifest.dependencies ?? {}) };
+    const devDependencies = { ...(manifest.devDependencies ?? {}) };
+    const declaredPackages = new Set([
+      ...Object.keys(dependencies),
+      ...Object.keys(devDependencies)
+    ]);
+    const importedPackages = collectImportedNodePackages(frontendFiles);
+    let changed = false;
+
+    for (const pkg of importedPackages) {
+      if (declaredPackages.has(pkg)) {
+        continue;
+      }
+
+      const target = shouldUseDevDependency(pkg) ? devDependencies : dependencies;
+      target[pkg] = inferNodePackageVersion(pkg);
+      declaredPackages.add(pkg);
+      changed = true;
+    }
+
+    if (!changed) {
+      return undefined;
+    }
+
+    manifest.dependencies = sortRecordKeys(dependencies);
+    manifest.devDependencies = sortRecordKeys(devDependencies);
+    return `${JSON.stringify(manifest, null, 2)}\n`;
+  } catch {
+    return undefined;
+  }
 }
 
 function serializeGeneratedFiles(files: GeneratedFile[]): string {
@@ -734,6 +880,15 @@ function detectFenceLanguage(filePath: string): string {
 }
 
 function parseGeneratedFilesFromResponse(response: string): GeneratedFile[] {
+  const standardFiles = parseStandardGeneratedFilesFromResponse(response);
+  if (standardFiles.length > 0) {
+    return standardFiles;
+  }
+
+  return parseWrappedFenceGeneratedFilesFromResponse(response);
+}
+
+function parseStandardGeneratedFilesFromResponse(response: string): GeneratedFile[] {
   const files: GeneratedFile[] = [];
   let buffer = response;
 
@@ -748,6 +903,32 @@ function parseGeneratedFilesFromResponse(response: string): GeneratedFile[] {
   }
 
   return files;
+}
+
+function parseWrappedFenceGeneratedFilesFromResponse(response: string): GeneratedFile[] {
+  const normalized = response.replace(/\r\n/g, "\n");
+  const files: GeneratedFile[] = [];
+  const pattern = /```FILE:\s*([^\n]+)\n([\s\S]*?)\n```/g;
+
+  for (const match of normalized.matchAll(pattern)) {
+    const filePath = match[1]?.trim();
+    const content = match[2] ?? "";
+    if (!filePath) {
+      continue;
+    }
+
+    files.push(normalizeGeneratedFile(filePath, content));
+  }
+
+  return files;
+}
+
+function truncateForDebug(value: string, maxLength = 4000): string {
+  if (value.length <= maxLength) {
+    return value;
+  }
+
+  return `${value.slice(0, maxLength)}\n...<truncated>`;
 }
 
 function validateGeneratedArtifacts(
@@ -956,4 +1137,35 @@ function normalizePackageSpecifier(specifier: string): string | undefined {
 
   const [name] = specifier.split("/");
   return name || undefined;
+}
+
+function shouldUseDevDependency(packageName: string): boolean {
+  return (
+    packageName.startsWith("@types/") ||
+    packageName.startsWith("@vitejs/") ||
+    packageName === "vite"
+  );
+}
+
+function inferNodePackageVersion(packageName: string): string {
+  const pinnedVersions: Record<string, string> = {
+    react: "^18.0.0",
+    "react-dom": "^18.0.0",
+    "react-router-dom": "^6.0.0",
+    antd: "^4.16.13",
+    axios: "^0.21.1",
+    vite: "^2.6.4",
+    "@vitejs/plugin-react": "^1.3.2",
+    typescript: "^4.5.2",
+    "@types/react": "^17.0.38",
+    "@types/react-dom": "^17.0.11"
+  };
+
+  return pinnedVersions[packageName] ?? "*";
+}
+
+function sortRecordKeys(record: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(record).sort(([left], [right]) => left.localeCompare(right))
+  );
 }
