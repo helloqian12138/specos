@@ -8,6 +8,7 @@ import {
   loadManagedScaffoldFiles,
   shouldUseDevDependency
 } from "./scaffold.js";
+import { RuntimeFailure, runRuntimeValidation } from "./runtime.js";
 import { emitGeneratedProject } from "../emitter/project-emitter.js";
 import { loadSpecProject } from "../spec/loader.js";
 import { ensureDirectory, writeJsonFile, writeTextFile } from "../utils/fs.js";
@@ -43,10 +44,10 @@ export async function compileSpecProject(
 ): Promise<CompileResult> {
   const logger = createLogger(config.compile.verbose);
 
-  logger.step("1/5", `Loading spec project from ${config.projectDir}`);
+  logger.step("1/7", `Loading spec project from ${config.projectDir}`);
   const project = await loadSpecProject(config.projectDir, config.outDir);
 
-  logger.step("2/5", "Validating spec files");
+  logger.step("2/7", "Validating spec files");
   const warnings = validateSpecFiles(project.files.map(file => file.relativePath));
   for (const warning of warnings) {
     logger.warn(warning);
@@ -64,7 +65,7 @@ export async function compileSpecProject(
   });
 
   const planMessages = buildPlanMessages(project.promptContext, config);
-  logger.step("3/5", "Requesting AI compile plan");
+  logger.step("3/7", "Requesting AI compile plan");
   logger.debug(config.compile.debug, "plan request", JSON.stringify(planMessages, null, 2));
   const compilePlan = await client.streamChatCompletion(
     {
@@ -90,7 +91,7 @@ export async function compileSpecProject(
   }
 
   logger.step(
-    "4/5",
+    "4/7",
     `Generating project files with ${targets.join(" + ")} agent(s)${
       targets.length > 1 ? " in parallel" : ""
     }`
@@ -116,7 +117,7 @@ export async function compileSpecProject(
     promptTraceByTarget[target] = generationMessages;
 
     logger.step(
-      target === "frontend" ? "4a/5" : "4b/5",
+      target === "frontend" ? "4a/7" : "4b/7",
       `Running ${target} agent`
     );
     logger.debug(
@@ -194,7 +195,7 @@ export async function compileSpecProject(
     warnings.push(warning);
   }
 
-  logger.step("5/6", "Running AI static review and repair");
+  logger.step("5/7", "Running AI static review and repair");
   const deterministicRepair = await applyDeterministicRepairs({
     files,
     targets,
@@ -259,23 +260,61 @@ export async function compileSpecProject(
       compilePlan,
       generationMessagesByTarget: promptTraceByTarget,
       generationTranscriptsByTarget: transcripts,
-      errorMessage: `Generated project failed after AI static review: ${uniqueFailureReasons.join("; ")}`
+      errorMessage: `Generated project failed after AI static review: ${uniqueFailureReasons.join("; ")}`,
+      staticReviewTranscript: repairResult.transcript
     });
     throw new Error(
       `Compile failed after 3 AI static review passes: ${uniqueFailureReasons.join("; ")}`
     );
   }
 
-  logger.step("6/6", `Finalizing compile output in ${config.outDir}`);
+  logger.step("6/7", "Running runtime validation and repair");
+  const runtimeRepairResult = await runAiRuntimeReviewAndRepair({
+    client,
+    config,
+    logger,
+    targets,
+    specContext: project.promptContext,
+    compilePlan,
+    files: repairedFiles,
+    outDir: config.outDir
+  });
+  const runtimeRepairedFiles = runtimeRepairResult.files;
+  if (runtimeRepairResult.appliedFixes > 0) {
+    warnings.push(
+      `AI runtime review applied ${runtimeRepairResult.appliedFixes} file fix${
+        runtimeRepairResult.appliedFixes === 1 ? "" : "es"
+      }`
+    );
+  }
+
+  if (!runtimeRepairResult.success) {
+    const uniqueFailureReasons = Array.from(new Set(runtimeRepairResult.failureReasons));
+    await writeDebugFailureArtifacts({
+      outDir: config.outDir,
+      planMessages,
+      compilePlan,
+      generationMessagesByTarget: promptTraceByTarget,
+      generationTranscriptsByTarget: transcripts,
+      errorMessage: `Generated project failed after runtime validation: ${uniqueFailureReasons.join("; ")}`,
+      staticReviewTranscript: repairResult.transcript,
+      runtimeReviewTranscript: runtimeRepairResult.transcript
+    });
+    throw new Error(
+      `Compile failed after 3 AI runtime repair passes: ${uniqueFailureReasons.join("; ")}`
+    );
+  }
+
+  logger.step("7/7", `Finalizing compile output in ${config.outDir}`);
   await emitGeneratedProject({
     outDir: config.outDir,
     clean: false,
-    files: repairedFiles,
+    files: runtimeRepairedFiles,
     metadata: {
       generatedAt: new Date().toISOString(),
       projectDir: config.projectDir,
       model: config.model,
-      summary: `Generated ${repairedFiles.length} files from streamed code blocks.`,
+      summary: `Generated ${runtimeRepairedFiles.length} files from streamed code blocks.`,
       warnings
     },
     promptTrace: {
@@ -288,12 +327,16 @@ export async function compileSpecProject(
         appliedFixes: repairResult.appliedFixes,
         transcript: repairResult.transcript
       },
+      runtimeReview: {
+        appliedFixes: runtimeRepairResult.appliedFixes,
+        transcript: runtimeRepairResult.transcript
+      },
       protocol: getFileBlockProtocolDescription()
     }
   });
 
   return {
-    files: repairedFiles,
+    files: runtimeRepairedFiles,
     warnings
   };
 }
@@ -575,6 +618,8 @@ async function writeDebugFailureArtifacts(input: {
   generationMessagesByTarget: Partial<Record<CompileTarget, ReturnType<typeof buildGenerationMessages>>>;
   generationTranscriptsByTarget: Partial<Record<CompileTarget, string>>;
   errorMessage: string;
+  staticReviewTranscript?: string;
+  runtimeReviewTranscript?: string;
 }): Promise<void> {
   const metaDir = path.join(input.outDir, ".specos");
   await ensureDirectory(metaDir);
@@ -583,6 +628,12 @@ async function writeDebugFailureArtifacts(input: {
     compilePlan: input.compilePlan,
     generateByTarget: input.generationMessagesByTarget,
     generationTranscriptsByTarget: input.generationTranscriptsByTarget,
+    staticReview: input.staticReviewTranscript
+      ? { transcript: input.staticReviewTranscript }
+      : undefined,
+    runtimeReview: input.runtimeReviewTranscript
+      ? { transcript: input.runtimeReviewTranscript }
+      : undefined,
     protocol: getFileBlockProtocolDescription(),
     error: input.errorMessage
   });
@@ -622,6 +673,25 @@ async function applyDeterministicRepairs(input: {
           "deterministic repair frontend/package.json",
           nextPackageJson
         );
+      }
+    }
+
+    const indexPath = filesMap.has("frontend/src/index.tsx")
+      ? "frontend/src/index.tsx"
+      : filesMap.has("frontend/src/index.jsx")
+        ? "frontend/src/index.jsx"
+        : undefined;
+    if (indexPath) {
+      const indexContent = filesMap.get(indexPath) ?? "";
+      const nextIndexContent = repairFrontendEntryFile(indexContent);
+      if (nextIndexContent && nextIndexContent !== indexContent) {
+        filesMap.set(indexPath, nextIndexContent);
+        await writeGeneratedFile(input.outDir, {
+          path: indexPath,
+          content: nextIndexContent
+        });
+        appliedFixes += 1;
+        input.logger.debug(input.debug, `deterministic repair ${indexPath}`, nextIndexContent);
       }
     }
   }
@@ -781,6 +851,131 @@ async function runAiStaticReviewAndRepair(input: {
   };
 }
 
+async function runAiRuntimeReviewAndRepair(input: {
+  client: OpenAIClient;
+  config: ResolvedCompileConfig;
+  logger: ReturnType<typeof createLogger>;
+  targets: CompileTarget[];
+  specContext: string;
+  compilePlan: string;
+  files: GeneratedFile[];
+  outDir: string;
+}): Promise<RepairPassResult> {
+  let currentFiles = input.files;
+  let appliedFixes = 0;
+  let transcript = "";
+  const failureReasons: string[] = [];
+
+  for (let pass = 1; pass <= 3; pass += 1) {
+    input.logger.step("runtime", `Runtime validation pass ${pass}`);
+    const runtimeValidation = await runRuntimeValidation({
+      outDir: input.outDir,
+      targets: input.targets,
+      logger: input.logger,
+      debug: input.config.compile.debug
+    });
+
+    if (runtimeValidation.success) {
+      return {
+        files: currentFiles,
+        appliedFixes,
+        transcript: transcript.trim(),
+        success: true,
+        failureReasons
+      };
+    }
+
+    const formattedFailures = formatRuntimeFailures(runtimeValidation.failures);
+    failureReasons.push(
+      ...runtimeValidation.failures.map(
+        failure => `${failure.target} ${failure.stage}: ${failure.summary}`
+      )
+    );
+
+    const messages = buildRuntimeReviewMessages({
+      specContext: input.specContext,
+      compilePlan: input.compilePlan,
+      targets: input.targets,
+      files: currentFiles,
+      runtimeFailures: runtimeValidation.failures
+    });
+
+    let response = "";
+    await input.client.streamChatCompletion(
+      {
+        model: input.config.model,
+        temperature: 0,
+        messages
+      },
+      chunk => {
+        response += chunk;
+      }
+    );
+    transcript += `\n\n=== runtime pass ${pass} ===\n${formattedFailures}\n\n${response}`;
+    input.logger.debug(
+      input.config.compile.debug,
+      `runtime review pass ${pass} raw response`,
+      truncateForDebug(response)
+    );
+
+    const repairedFiles = parseGeneratedFilesFromResponse(response);
+    input.logger.debug(
+      input.config.compile.debug,
+      `runtime review pass ${pass} parsed files`,
+      JSON.stringify(repairedFiles.map(file => file.path), null, 2)
+    );
+
+    if (repairedFiles.length === 0) {
+      failureReasons.push(
+        `AI runtime review pass ${pass} returned no parsable FILE blocks for repair`
+      );
+      continue;
+    }
+
+    const filesMap = new Map(currentFiles.map(file => [file.path, file.content]));
+    for (const repairedFile of repairedFiles) {
+      filesMap.set(repairedFile.path, repairedFile.content);
+      await writeGeneratedFile(input.outDir, repairedFile);
+    }
+
+    currentFiles = Array.from(filesMap.entries()).map(([filePath, content]) => ({
+      path: filePath,
+      content
+    }));
+    appliedFixes += repairedFiles.length;
+  }
+
+  const finalRuntimeValidation = await runRuntimeValidation({
+    outDir: input.outDir,
+    targets: input.targets,
+    logger: input.logger,
+    debug: input.config.compile.debug
+  });
+  if (finalRuntimeValidation.success) {
+    return {
+      files: currentFiles,
+      appliedFixes,
+      transcript: transcript.trim(),
+      success: true,
+      failureReasons
+    };
+  }
+
+  failureReasons.push(
+    ...finalRuntimeValidation.failures.map(
+      failure => `${failure.target} ${failure.stage}: ${failure.summary}`
+    )
+  );
+
+  return {
+    files: currentFiles,
+    appliedFixes,
+    transcript: transcript.trim(),
+    success: false,
+    failureReasons: Array.from(new Set(failureReasons))
+  };
+}
+
 function buildStaticReviewMessages(input: {
   specContext: string;
   compilePlan: string;
@@ -829,6 +1024,74 @@ ${serializeGeneratedFiles(input.files)}`
   ];
 }
 
+function buildRuntimeReviewMessages(input: {
+  specContext: string;
+  compilePlan: string;
+  targets: CompileTarget[];
+  files: GeneratedFile[];
+  runtimeFailures: RuntimeFailure[];
+}) {
+  return [
+    {
+      role: "system" as const,
+      content:
+        "You are the SpecOS runtime repair agent. Real runtime execution has already been attempted for the generated project. Fix only the files required to resolve the reported install, build, startup, import, routing, or runtime integration failures. The spec remains the source of truth. You must return only full replacement FILE blocks for every file you change. Do not return prose, markdown lists, JSON, explanations, or OK."
+    },
+    {
+      role: "user" as const,
+      content: `Repair this generated project using the runtime diagnostics below.
+
+Targets:
+${input.targets.join(", ")}
+
+Compile plan:
+${input.compilePlan.trim() || "(empty plan output)"}
+
+Runtime repair rules:
+- The spec is authoritative.
+- Fix the actual cause shown by the runtime diagnostics.
+- Keep the project runnable after dependency installation.
+- You may modify generated files and runtime scaffold files such as frontend/package.json, frontend/vite.config.ts, frontend/tsconfig.json, frontend/index.html, and backend/requirements.txt when they are directly involved in the failure.
+- Do not modify root .env.example unless the runtime diagnostics explicitly require it.
+- Return only replacement FILE blocks for the files to change.
+- Do not return explanations.
+- Do not wrap \`FILE:\` lines inside an outer markdown code fence.
+
+Runtime diagnostics:
+${formatRuntimeFailures(input.runtimeFailures)}
+
+Spec project:
+${input.specContext}
+
+Generated files:
+${serializeGeneratedFiles(input.files)}`
+    }
+  ];
+}
+
+function formatRuntimeFailures(failures: RuntimeFailure[]): string {
+  return failures
+    .map(failure => {
+      const output = truncateForDebug(failure.output.trim() || "(no output)", 2500);
+      return [
+        `- target: ${failure.target}`,
+        `  stage: ${failure.stage}`,
+        `  command: ${failure.command}`,
+        `  summary: ${failure.summary}`,
+        "  output:",
+        indentMultilineBlock(output, "    ")
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function indentMultilineBlock(value: string, prefix: string): string {
+  return value
+    .split("\n")
+    .map(line => `${prefix}${line}`)
+    .join("\n");
+}
+
 function repairFrontendPackageManifest(
   packageJsonContent: string,
   frontendFiles: GeneratedFile[]
@@ -869,6 +1132,42 @@ function repairFrontendPackageManifest(
   } catch {
     return undefined;
   }
+}
+
+function repairFrontendEntryFile(content: string): string | undefined {
+  let next = content;
+  let changed = false;
+
+  if (/from\s+['"]react-dom['"]/.test(next)) {
+    next = next.replace(
+      /import\s+ReactDOM\s+from\s+['"]react-dom['"];?\n?/,
+      "import { createRoot } from 'react-dom/client';\n"
+    );
+    changed = true;
+  }
+
+  if (/['"]antd\/dist\/antd\.css['"]/.test(next)) {
+    next = next.replace(/['"]antd\/dist\/antd\.css['"]/g, "'antd/dist/reset.css'");
+    changed = true;
+  }
+
+  if (/ReactDOM\.render\s*\(/.test(next)) {
+    next = next.replace(
+      /ReactDOM\.render\s*\(\s*([\s\S]*?)\s*,\s*document\.getElementById\(['"]root['"]\)\s*\);?/m,
+      [
+        "const container = document.getElementById('root');",
+        "",
+        "if (!container) {",
+        "  throw new Error('Root container not found');",
+        "}",
+        "",
+        "createRoot(container).render($1);"
+      ].join("\n")
+    );
+    changed = true;
+  }
+
+  return changed ? `${next.replace(/\s+$/, "")}\n` : undefined;
 }
 
 function serializeGeneratedFiles(files: GeneratedFile[]): string {
@@ -1003,6 +1302,14 @@ function validateGeneratedArtifacts(
     for (const file of files.filter(isBrowserRuntimeFrontendFile)) {
       if (/https?:\/\/localhost:\d+/i.test(file.content)) {
         errors.push(`frontend hardcodes a localhost URL in ${file.path}; use relative /api paths instead`);
+      }
+
+      if (/['"`]antd\/dist\/antd\.css['"`]/.test(file.content)) {
+        errors.push(`frontend imports removed Ant Design stylesheet path in ${file.path}; use antd/dist/reset.css or component styles compatible with antd v5`);
+      }
+
+      if (/ReactDOM\.render\s*\(/.test(file.content)) {
+        warnings.push(`frontend uses legacy ReactDOM.render in ${file.path}; prefer react-dom/client createRoot for React 18`);
       }
     }
 
