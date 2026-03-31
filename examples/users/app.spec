@@ -117,8 +117,8 @@ Component CreateUserModal:
 
     onSubmit:
       dispatch CreateUser(name,age,sex,city)
-      refresh todos
       closeModal
+      refresh users
 
 ---
 

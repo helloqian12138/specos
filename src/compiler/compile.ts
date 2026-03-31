@@ -11,6 +11,7 @@ import {
 import { RuntimeFailure, runRuntimeValidation } from "./runtime.js";
 import { emitGeneratedProject } from "../emitter/project-emitter.js";
 import { loadSpecProject } from "../spec/loader.js";
+import { parseSpecProject } from "../spec/parser.js";
 import { ensureDirectory, writeJsonFile, writeTextFile } from "../utils/fs.js";
 import { createLogger } from "../utils/logger.js";
 
@@ -254,18 +255,20 @@ export async function compileSpecProject(
       ...repairedValidation.errors
     ];
     const uniqueFailureReasons = Array.from(new Set(failureReasons));
+    const formattedFailure = formatFailureReport(
+      "Compile failed after 3 AI static review passes.",
+      uniqueFailureReasons
+    );
     await writeDebugFailureArtifacts({
       outDir: config.outDir,
       planMessages,
       compilePlan,
       generationMessagesByTarget: promptTraceByTarget,
       generationTranscriptsByTarget: transcripts,
-      errorMessage: `Generated project failed after AI static review: ${uniqueFailureReasons.join("; ")}`,
+      errorMessage: formattedFailure,
       staticReviewTranscript: repairResult.transcript
     });
-    throw new Error(
-      `Compile failed after 3 AI static review passes: ${uniqueFailureReasons.join("; ")}`
-    );
+    throw new Error(formattedFailure);
   }
 
   logger.step("6/7", "Running runtime validation and repair");
@@ -290,19 +293,21 @@ export async function compileSpecProject(
 
   if (!runtimeRepairResult.success) {
     const uniqueFailureReasons = Array.from(new Set(runtimeRepairResult.failureReasons));
+    const formattedFailure = formatFailureReport(
+      "Compile failed after 3 AI runtime repair passes.",
+      uniqueFailureReasons
+    );
     await writeDebugFailureArtifacts({
       outDir: config.outDir,
       planMessages,
       compilePlan,
       generationMessagesByTarget: promptTraceByTarget,
       generationTranscriptsByTarget: transcripts,
-      errorMessage: `Generated project failed after runtime validation: ${uniqueFailureReasons.join("; ")}`,
+      errorMessage: formattedFailure,
       staticReviewTranscript: repairResult.transcript,
       runtimeReviewTranscript: runtimeRepairResult.transcript
     });
-    throw new Error(
-      `Compile failed after 3 AI runtime repair passes: ${uniqueFailureReasons.join("; ")}`
-    );
+    throw new Error(formattedFailure);
   }
 
   logger.step("7/7", `Finalizing compile output in ${config.outDir}`);
@@ -526,7 +531,7 @@ ${specContext}`
 
 function getTargetInstructions(target: CompileTarget, config: ResolvedCompileConfig): string {
   if (target === "frontend") {
-    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit business-facing frontend files under frontend/, especially frontend/src/. Implement a complete runnable frontend app, not just isolated components. The compiler already provides frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, and root .env.example; do not emit or replace those scaffold files. Also implement pages, components, API client calls, and route wiring. Environment requirements: target modern Node 18+ compatibility; assume a Vite + React + TypeScript scaffold already exists; do not switch toolchains. Networking requirements: do not hardcode absolute browser API URLs such as \`http://localhost:5000\` in frontend code; call backend APIs through same-origin relative paths such as \`/api\`. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
+    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit business-facing frontend files under frontend/, especially frontend/src/. Implement a complete runnable frontend app, not just isolated components. The compiler already provides frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, and root .env.example; do not emit or replace those scaffold files. Also implement pages, components, API client calls, and route wiring. Environment requirements: target modern Node 18+ compatibility; assume a Vite + React + TypeScript scaffold already exists; do not switch toolchains. Routing library requirements: the managed scaffold uses react-router-dom v6, so use v6 APIs only. Use \`Routes\`, \`Route\`, and \`Navigate\`; do not use deprecated v5 APIs such as \`Switch\`, \`Redirect\`, or \`component=\`. Networking requirements: do not hardcode absolute browser API URLs such as \`http://localhost:5000\` in frontend code; call backend APIs through same-origin relative paths such as \`/api\`. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
   }
 
   return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit executable backend code under backend/, such as backend/app.py, route modules, services, and models. Do not emit environment scaffold files. The compiler already provides backend/requirements.txt and root .env.example; do not emit or replace them. Networking requirements: generated backend APIs should be compatible with a frontend dev server on http://localhost:3000; when appropriate, expose API routes under an /api prefix and include local-development CORS support such as Flask-Cors for http://localhost:3000 and http://127.0.0.1:3000 so browser requests are not blocked if the frontend is served separately. Spec compliance requirements: action inputs, storage fields, validation rules, and response payloads must match the spec and stay consistent with the frontend-facing API contract. Do not emit frontend runtime code files.`;
@@ -694,6 +699,23 @@ async function applyDeterministicRepairs(input: {
         input.logger.debug(input.debug, `deterministic repair ${indexPath}`, nextIndexContent);
       }
     }
+
+    for (const [filePath, content] of filesMap.entries()) {
+      if (!isBrowserRuntimeFrontendFile({ path: filePath, content })) {
+        continue;
+      }
+
+      const nextContent = repairFrontendRouterV6Usage(content);
+      if (nextContent && nextContent !== content) {
+        filesMap.set(filePath, nextContent);
+        await writeGeneratedFile(input.outDir, {
+          path: filePath,
+          content: nextContent
+        });
+        appliedFixes += 1;
+        input.logger.debug(input.debug, `deterministic repair ${filePath}`, nextContent);
+      }
+    }
   }
 
   if (input.targets.includes("backend")) {
@@ -782,6 +804,11 @@ async function runAiStaticReviewAndRepair(input: {
         failureReasons.push(
           `AI review pass ${pass} returned OK but validation still failed: ${validation.errors.join("; ")}`
         );
+        if (pass < 3) {
+          input.logger.warn(
+            `Static validation still failed after pass ${pass}. Retrying AI repair (${pass + 1}/3).`
+          );
+        }
         continue;
       }
 
@@ -804,6 +831,9 @@ async function runAiStaticReviewAndRepair(input: {
       failureReasons.push(
         `AI review pass ${pass} returned neither OK nor parsable FILE blocks for repairs`
       );
+      if (pass < 3) {
+        input.logger.warn(`Static review pass ${pass} produced no usable repair. Retrying (${pass + 1}/3).`);
+      }
       continue;
     }
 
@@ -840,6 +870,11 @@ async function runAiStaticReviewAndRepair(input: {
     failureReasons.push(
       `Validation errors after AI review pass ${pass}: ${validation.errors.join("; ")}`
     );
+    if (pass < 3) {
+      input.logger.warn(
+        `Static validation still failed after pass ${pass}. Retrying AI repair (${pass + 1}/3).`
+      );
+    }
   }
 
   return {
@@ -1170,6 +1205,51 @@ function repairFrontendEntryFile(content: string): string | undefined {
   return changed ? `${next.replace(/\s+$/, "")}\n` : undefined;
 }
 
+function repairFrontendRouterV6Usage(content: string): string | undefined {
+  let next = content;
+  let changed = false;
+
+  if (/\bRedirect\b/.test(next)) {
+    next = next.replace(/\bRedirect\b/g, "Navigate");
+    changed = true;
+  }
+
+  if (/\bSwitch\b/.test(next)) {
+    next = next.replace(/\bSwitch\b/g, "Routes");
+    changed = true;
+  }
+
+  if (/<Navigate([^>]*?)\s+from=(["'])[^"']+\2([^>]*?)\/>/.test(next)) {
+    next = next.replace(/<Navigate([^>]*?)\s+from=(["'])[^"']+\2([^>]*?)\/>/g, "<Navigate$1$3 />");
+    changed = true;
+  }
+
+  if (/<Navigate([^>]*?)\s+to=(["'])([^"']+)\2([^>]*?)\/>/.test(next) && !/\breplace=/.test(next)) {
+    next = next.replace(
+      /<Navigate([^>]*?)\s+to=(["'])([^"']+)\2([^>]*?)\/>/g,
+      "<Navigate$1 to=$2$3$2 replace$4 />"
+    );
+    changed = true;
+  }
+
+  if (/import\s*\{\s*([^}]*?)\s*\}\s*from\s*['"]react-router-dom['"]/.test(next)) {
+    next = next.replace(
+      /import\s*\{\s*([^}]*?)\s*\}\s*from\s*['"]react-router-dom['"]/g,
+      (_, imports: string) => {
+        const normalized = imports
+          .split(",")
+          .map(part => part.trim())
+          .filter(Boolean)
+          .map(part => (part === "Redirect" ? "Navigate" : part === "Switch" ? "Routes" : part));
+        return `import { ${Array.from(new Set(normalized)).join(", ")} } from 'react-router-dom'`;
+      }
+    );
+    changed = true;
+  }
+
+  return changed ? `${next.replace(/\s+$/, "")}\n` : undefined;
+}
+
 function serializeGeneratedFiles(files: GeneratedFile[]): string {
   return files
     .map(file => {
@@ -1260,8 +1340,13 @@ function validateGeneratedArtifacts(
   targets: CompileTarget[],
   specContext: string
 ): { errors: string[]; warnings: string[] } {
+  const parsedSpec = parseSpecProject(specContext);
   const fileSet = new Set(files.map(file => file.path));
   const fileMap = new Map(files.map(file => [file.path, file.content]));
+  const frontendFiles = files.filter(file => file.path.startsWith("frontend/"));
+  const backendFiles = files.filter(file => file.path.startsWith("backend/"));
+  const frontendContent = frontendFiles.map(file => file.content).join("\n");
+  const backendContent = backendFiles.map(file => file.content).join("\n");
   const errors: string[] = [];
   const warnings: string[] = [];
 
@@ -1291,7 +1376,7 @@ function validateGeneratedArtifacts(
 
     const declaredPackages = collectDeclaredNodePackages(packageJson);
     const importedPackages = collectImportedNodePackages(
-      files.filter(file => file.path.startsWith("frontend/"))
+      frontendFiles
     );
     for (const pkg of importedPackages) {
       if (!declaredPackages.has(pkg)) {
@@ -1304,6 +1389,18 @@ function validateGeneratedArtifacts(
         errors.push(`frontend hardcodes a localhost URL in ${file.path}; use relative /api paths instead`);
       }
 
+      if (/\bRedirect\b/.test(file.content)) {
+        errors.push(
+          `frontend uses react-router-dom Redirect in ${file.path}; use Navigate for react-router-dom v6`
+        );
+      }
+
+      if (/\bSwitch\b/.test(file.content)) {
+        errors.push(
+          `frontend uses react-router-dom Switch in ${file.path}; use Routes for react-router-dom v6`
+        );
+      }
+
       if (/['"`]antd\/dist\/antd\.css['"`]/.test(file.content)) {
         errors.push(`frontend imports removed Ant Design stylesheet path in ${file.path}; use antd/dist/reset.css or component styles compatible with antd v5`);
       }
@@ -1313,15 +1410,164 @@ function validateGeneratedArtifacts(
       }
     }
 
-    const appContent =
-      fileMap.get("frontend/src/App.tsx") ??
-      fileMap.get("frontend/src/App.jsx") ??
-      "";
-    const specPageRoutes = Array.from(specContext.matchAll(/Page\s+\w+\s*\((\/[^)\s]+)\)/g)).map(
-      match => match[1]
-    );
+    const appContent = fileMap.get("frontend/src/App.tsx") ?? fileMap.get("frontend/src/App.jsx") ?? "";
+    const specPageRoutes = parsedSpec.pages.map(page => page.route);
     if (specPageRoutes.length > 0 && !/path\s*=\s*["']\/["']/.test(appContent)) {
       warnings.push("frontend App is missing an explicit root route even though the spec defines page paths");
+    }
+
+    for (const page of parsedSpec.pages) {
+      const pageContent = findFrontendModuleContent(frontendFiles, page.name) ?? frontendContent;
+
+      if (!containsQuotedLiteral(frontendContent, page.route)) {
+        errors.push(`spec route ${page.route} is missing from generated frontend code`);
+      }
+
+      for (const text of page.texts) {
+        if (!containsTextEvidence(pageContent, text)) {
+          errors.push(`spec page text "${text}" from page ${page.name} is missing from generated frontend code`);
+        }
+      }
+
+      for (const layout of page.layouts) {
+        if (!containsLayoutEvidence(pageContent, layout)) {
+          errors.push(`spec layout ${layout} from page ${page.name} is missing or changed in generated frontend code`);
+        }
+      }
+
+      for (const control of page.controls) {
+        if (!containsControlEvidence(pageContent, control.kind)) {
+          errors.push(
+            `spec frontend control ${control.kind}${control.name ? `(${control.name})` : ""} from page ${page.name} is missing from generated frontend code`
+          );
+        }
+      }
+
+      for (const button of page.buttons) {
+        if (!containsTextEvidence(pageContent, button)) {
+          errors.push(`spec button "${button}" from page ${page.name} is missing from generated frontend code`);
+        }
+      }
+
+      for (const flow of page.buttonFlows) {
+        if (flow.dispatchAction && !containsActionUsage(pageContent, flow.dispatchAction)) {
+          errors.push(
+            `spec button "${flow.label}" on page ${page.name} does not appear to dispatch ${flow.dispatchAction} in generated frontend code`
+          );
+        }
+
+        if (
+          flow.refreshState &&
+          !containsRefreshEvidence(pageContent, flow.refreshState, flow.dispatchAction)
+        ) {
+          errors.push(
+            `spec button "${flow.label}" on page ${page.name} does not appear to refresh ${flow.refreshState} in generated frontend code`
+          );
+        }
+
+        if (flow.openModal && !containsModalOpenEvidence(pageContent, flow.openModal)) {
+          errors.push(
+            `spec button "${flow.label}" on page ${page.name} does not appear to open modal ${flow.openModal} in generated frontend code`
+          );
+        }
+      }
+    }
+
+    for (const state of parsedSpec.states) {
+      if (!containsIdentifier(frontendContent, state.name)) {
+        errors.push(`spec state ${state.name} is missing from generated frontend code`);
+      }
+
+      if (state.source && !containsIdentifier(frontendContent, state.source)) {
+        errors.push(
+          `spec state source ${state.source} for state ${state.name} is missing from generated frontend code`
+        );
+      }
+    }
+
+    for (const component of parsedSpec.components) {
+      const componentContent = findFrontendModuleContent(frontendFiles, component.name) ?? frontendContent;
+
+      if (!containsIdentifier(frontendContent, component.name)) {
+        errors.push(`spec component ${component.name} is missing from generated frontend code`);
+      }
+
+      for (const field of component.formFields) {
+        if (!containsIdentifier(componentContent, field)) {
+          errors.push(
+            `spec form field ${field} from component ${component.name} is missing from generated frontend code`
+          );
+        }
+      }
+
+      for (const modalTitle of component.modalTitles) {
+        if (!containsTextEvidence(componentContent, modalTitle)) {
+          errors.push(
+            `spec modal title "${modalTitle}" from component ${component.name} is missing from generated frontend code`
+          );
+        }
+      }
+
+      for (const button of component.buttons) {
+        if (!containsTextEvidence(componentContent, button)) {
+          errors.push(`spec button "${button}" from component ${component.name} is missing from generated frontend code`);
+        }
+      }
+
+      for (const formControl of component.formControls) {
+        if (!containsFormControlEvidence(componentContent, formControl.control)) {
+          errors.push(
+            `spec form control ${formControl.control} for field ${formControl.name} in component ${component.name} is missing or changed in generated frontend code`
+          );
+        }
+      }
+
+      if (component.submitFlow?.dispatchAction && !containsActionUsage(componentContent, component.submitFlow.dispatchAction)) {
+        errors.push(
+          `spec component ${component.name} onSubmit does not appear to dispatch ${component.submitFlow.dispatchAction} in generated frontend code`
+        );
+      }
+
+      if (
+        component.submitFlow?.refreshState &&
+        !containsRefreshEvidence(
+          componentContent,
+          component.submitFlow.refreshState,
+          component.submitFlow.dispatchAction
+        )
+      ) {
+        errors.push(
+          `spec component ${component.name} onSubmit does not appear to refresh ${component.submitFlow.refreshState} in generated frontend code`
+        );
+      }
+
+      if (component.submitFlow?.closeModal && !containsCloseModalEvidence(componentContent)) {
+        errors.push(`spec component ${component.name} onSubmit does not appear to close the modal in generated frontend code`);
+      }
+    }
+
+    for (const page of parsedSpec.pages) {
+      for (const table of page.tables) {
+        if (!containsIdentifier(frontendContent, table.stateName)) {
+          errors.push(
+            `spec table state ${table.stateName} from page ${page.name} is missing from generated frontend code`
+          );
+        }
+
+        for (const column of table.columns) {
+          if (!containsTableColumnEvidence(frontendContent, column)) {
+            errors.push(
+              `spec table column ${column} from page ${page.name} is missing from generated frontend code`
+            );
+          }
+        }
+      }
+    }
+
+    for (const action of parsedSpec.actions) {
+      if (action.apiPath && !containsQuotedLiteral(frontendContent, action.apiPath)) {
+        warnings.push(`spec API path ${action.apiPath} for action ${action.name} is not referenced in frontend code`);
+      }
     }
 
     const usesApiPaths = files.some(
@@ -1371,9 +1617,206 @@ function validateGeneratedArtifacts(
         "generated project did not include a root-level environment template such as .env.example"
       );
     }
+
+    for (const action of parsedSpec.actions) {
+      if (action.apiPath && !containsQuotedLiteral(backendContent, action.apiPath)) {
+        errors.push(`spec API path ${action.apiPath} for action ${action.name} is missing from generated backend code`);
+      }
+
+      for (const field of action.inputFields) {
+        if (!containsIdentifier(backendContent, field)) {
+          errors.push(`spec action input ${field} for action ${action.name} is missing from generated backend code`);
+        }
+      }
+
+      for (const field of action.returnFields) {
+        if (!containsIdentifier(backendContent, field)) {
+          warnings.push(`spec action return field ${field} for action ${action.name} is not obvious in backend code`);
+        }
+      }
+    }
+
+    for (const entity of parsedSpec.entities) {
+      if (!containsIdentifier(backendContent, entity.name)) {
+        warnings.push(`spec entity ${entity.name} is not obvious in generated backend code`);
+      }
+
+      for (const field of entity.fields) {
+        if (!containsIdentifier(backendContent, field)) {
+          errors.push(`spec entity field ${field} for entity ${entity.name} is missing from generated backend code`);
+        }
+      }
+    }
   }
 
   return { errors, warnings };
+}
+
+function containsIdentifier(content: string, identifier: string): boolean {
+  if (!identifier.trim()) {
+    return false;
+  }
+
+  const pattern = new RegExp(`\\b${escapeRegExp(identifier)}\\b`);
+  return pattern.test(content);
+}
+
+function containsQuotedLiteral(content: string, literal: string): boolean {
+  if (!literal.trim()) {
+    return false;
+  }
+
+  const pattern = new RegExp(`["'\`]${escapeRegExp(literal)}["'\`]`);
+  return pattern.test(content);
+}
+
+function containsTextEvidence(content: string, text: string): boolean {
+  if (!text.trim()) {
+    return false;
+  }
+
+  if (containsQuotedLiteral(content, text)) {
+    return true;
+  }
+
+  const escaped = escapeRegExp(text).replace(/\s+/g, "\\s+");
+  const jsxPattern = new RegExp(`>\\s*${escaped}\\s*<`);
+  return jsxPattern.test(content);
+}
+
+function containsTableColumnEvidence(content: string, column: string): boolean {
+  if (containsIdentifier(content, column)) {
+    return true;
+  }
+
+  if (containsQuotedLiteral(content, column)) {
+    return true;
+  }
+
+  if (column.toLowerCase() === "action" && containsTextEvidence(content, "Action")) {
+    return true;
+  }
+
+  return false;
+}
+
+function containsActionUsage(content: string, actionName: string): boolean {
+  const base = stripVerbPrefix(actionName);
+  const subject = stripPluralSuffix(base);
+  const candidates = Array.from(
+    new Set(
+      [
+        actionName,
+        toCamelCase(actionName),
+        toPascalCase(actionName),
+        base,
+        toCamelCase(base),
+        toPascalCase(base),
+        `${inferCrudAlias(actionName)}${toPascalCase(subject)}`,
+        `${inferLookupAlias(actionName)}${toPascalCase(base)}`,
+        `${inferLookupAlias(actionName)}${toPascalCase(subject)}`
+      ].filter(Boolean)
+    )
+  );
+
+  return candidates.some(candidate => containsIdentifier(content, candidate));
+}
+
+function containsRefreshEvidence(
+  content: string,
+  stateName: string,
+  relatedActionName?: string
+): boolean {
+  const singularState = stripPluralSuffix(stateName);
+  const candidates = [
+    stateName,
+    singularState,
+    `set${toPascalCase(stateName)}`,
+    `set${toPascalCase(singularState)}`,
+    `fetch${toPascalCase(singularState)}`,
+    `fetch${toPascalCase(stateName)}`,
+    `load${toPascalCase(singularState)}`,
+    `load${toPascalCase(stateName)}`,
+    `refresh${toPascalCase(stateName)}`,
+    `refresh${toPascalCase(singularState)}`,
+    `search${toPascalCase(stateName)}`,
+    `search${toPascalCase(singularState)}`
+  ];
+
+  if (relatedActionName) {
+    const actionSubject = stripPluralSuffix(stripVerbPrefix(relatedActionName));
+    candidates.push(
+      relatedActionName,
+      toCamelCase(relatedActionName),
+      `${inferCrudAlias(relatedActionName)}${toPascalCase(actionSubject)}`,
+      `${inferLookupAlias(relatedActionName)}${toPascalCase(actionSubject)}`
+    );
+  }
+
+  return candidates.some(candidate => containsIdentifier(content, candidate));
+}
+
+function containsModalOpenEvidence(content: string, modalName: string): boolean {
+  const candidates = [
+    modalName,
+    "setModalVisible",
+    "openModal",
+    "showModal",
+    "visible",
+    "open"
+  ];
+
+  return candidates.some(candidate => containsIdentifier(content, candidate));
+}
+
+function containsCloseModalEvidence(content: string): boolean {
+  const candidates = ["closeModal", "onClose", "setModalVisible", "setOpen", "setVisible"];
+  return candidates.some(candidate => containsIdentifier(content, candidate));
+}
+
+function findFrontendModuleContent(files: GeneratedFile[], moduleName: string): string | undefined {
+  const candidates = files.filter(file =>
+    new RegExp(`/${escapeRegExp(moduleName)}\\.(tsx|jsx|ts|js)$`).test(file.path)
+  );
+  return candidates[0]?.content;
+}
+
+function containsControlEvidence(content: string, kind: string): boolean {
+  switch (kind) {
+    case "input":
+      return /\bInput\b/.test(content);
+    case "button":
+      return /\bButton\b/.test(content);
+    case "table":
+      return /\bTable\b/.test(content);
+    default:
+      return containsIdentifier(content, kind);
+  }
+}
+
+function containsFormControlEvidence(content: string, control: string): boolean {
+  switch (control) {
+    case "input":
+      return /\bInput\b/.test(content);
+    case "input-number":
+      return /\bInputNumber\b/.test(content);
+    case "radio":
+      return /\bRadio\b/.test(content);
+    default:
+      return containsIdentifier(content, control);
+  }
+}
+
+function containsLayoutEvidence(content: string, layout: string): boolean {
+  const normalized = layout.toLowerCase();
+  if (normalized === "flex(space-between)") {
+    return (
+      (/display\s*:\s*["']?flex["']?/i.test(content) && /space-between/i.test(content)) ||
+      (/flex/i.test(content) && /justify-between/i.test(content))
+    );
+  }
+
+  return containsIdentifier(content, layout);
 }
 
 function isRootLevelEnvTemplate(filePath: string): boolean {
@@ -1486,6 +1929,58 @@ function normalizePackageSpecifier(specifier: string): string | undefined {
 
   const [name] = specifier.split("/");
   return name || undefined;
+}
+
+function escapeRegExp(input: string): string {
+  return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatFailureReport(summary: string, reasons: string[]): string {
+  if (reasons.length === 0) {
+    return summary;
+  }
+
+  return [summary, "", ...reasons.map(reason => `- ${reason}`)].join("\n");
+}
+
+function toCamelCase(input: string): string {
+  return input.length > 0 ? input[0].toLowerCase() + input.slice(1) : input;
+}
+
+function toPascalCase(input: string): string {
+  return input.length > 0 ? input[0].toUpperCase() + input.slice(1) : input;
+}
+
+function stripVerbPrefix(input: string): string {
+  return input.replace(/^(Create|Search|Delete|Update|Get|List)/, "");
+}
+
+function stripPluralSuffix(input: string): string {
+  return input.endsWith("s") && input.length > 1 ? input.slice(0, -1) : input;
+}
+
+function inferCrudAlias(actionName: string): string {
+  if (/^Create/i.test(actionName)) {
+    return "add";
+  }
+
+  if (/^Delete/i.test(actionName)) {
+    return "delete";
+  }
+
+  if (/^Update/i.test(actionName)) {
+    return "update";
+  }
+
+  return toCamelCase(stripVerbPrefix(actionName));
+}
+
+function inferLookupAlias(actionName: string): string {
+  if (/^(Search|Get|List)/i.test(actionName)) {
+    return "search";
+  }
+
+  return toCamelCase(stripVerbPrefix(actionName));
 }
 
 function sortRecordKeys(record: Record<string, string>): Record<string, string> {

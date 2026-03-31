@@ -1,6 +1,12 @@
+import path from "node:path";
 import { runCompileCommand } from "./commands/compile.js";
+import { runFixCommand } from "./commands/fix.js";
 import { runInitCommand } from "./commands/init.js";
 import { runRunCommand } from "./commands/run.js";
+import { writeProjectErrorLog } from "./debug/error-history.js";
+
+const ANSI_RED = "\u001b[31m";
+const ANSI_RESET = "\u001b[0m";
 
 type ParsedArgs = {
   command?: string;
@@ -24,6 +30,9 @@ export async function main(argv: string[]): Promise<void> {
       case "compile":
         await runCompileCommand(parsed);
         return;
+      case "fix":
+        await runFixCommand(parsed);
+        return;
       case "run":
         await runRunCommand(parsed);
         return;
@@ -32,7 +41,8 @@ export async function main(argv: string[]): Promise<void> {
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`spec error: ${message}`);
+    await persistLatestError(parsed, message);
+    console.error(`${ANSI_RED}spec error:${ANSI_RESET} ${message}`);
     process.exitCode = 1;
   }
 }
@@ -74,6 +84,7 @@ Usage:
   spec init --config <file>
   spec init --project [dir]
   spec compile <projectDir> [--outDir <path>] [--model <name>] [--host <url>] [--debug]
+  spec fix <projectDir> [--error <message>] [--latest] [--lastest] [--apply] [--outDir <path>] [--model <name>] [--host <url>]
   spec run <projectDir> [--outDir <path>] [--frontend-only] [--backend-only] [--install] [--watch] [--dev]
 
 Examples:
@@ -81,8 +92,33 @@ Examples:
   spec init --config ./spec.global.json
   spec init --project ./examples/todo-app
   spec compile ./examples/todo-app
+  spec fix ./examples/todo-app --error "backend start: process emitted a startup error before becoming ready"
+  spec fix ./examples/todo-app --latest
+  spec fix ./examples/todo-app --latest --apply
   spec run ./examples/todo-app --install
 `);
 }
 
 export type { ParsedArgs };
+
+async function persistLatestError(parsed: ParsedArgs, message: string): Promise<void> {
+  if (!parsed.command || !["compile", "run", "fix"].includes(parsed.command)) {
+    return;
+  }
+
+  const projectInput = typeof parsed.positionals[0] === "string" ? parsed.positionals[0] : ".";
+  const projectDir = path.resolve(process.cwd(), projectInput);
+
+  try {
+    await writeProjectErrorLog({
+      timestamp: new Date().toISOString(),
+      command: parsed.command,
+      projectDir,
+      cwd: process.cwd(),
+      error: message,
+      flags: parsed.flags
+    });
+  } catch {
+    // Error logging must never hide the original command failure.
+  }
+}
