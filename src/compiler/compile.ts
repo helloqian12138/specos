@@ -85,7 +85,7 @@ export async function compileSpecProject(
     throw new Error("No compile targets selected. Check the spec Environment or stack config.");
   }
 
-  const managedScaffoldFiles = await loadManagedScaffoldFiles(config.projectDir, project.promptContext);
+  const managedScaffoldFiles = await loadManagedScaffoldFiles(config.projectDir, project.promptContext, config.stack);
   const managedScaffoldPaths = new Set(listManagedScaffoldPaths());
   for (const scaffoldFile of managedScaffoldFiles) {
     await writeGeneratedFile(config.outDir, scaffoldFile);
@@ -447,11 +447,15 @@ function buildPlanMessages(specContext: string, config: ResolvedCompileConfig) {
     {
       role: "user" as const,
       content: `Project stack:
-Frontend: ${config.stack.frontend}
-UI: ${config.stack.ui}
-Language: ${config.stack.language}
-Backend: ${config.stack.backend}
-Database: ${config.stack.database}
+Frontend: ${config.stack.frontend.framework} ${config.stack.frontend.frameworkVersion ?? ""}
+UI: ${config.stack.frontend.ui} ${config.stack.frontend.uiVersion ?? ""}
+Frontend language: ${config.stack.frontend.language} ${config.stack.frontend.languageVersion ?? ""}
+Frontend runtime: http://${config.stack.frontend.host}:${config.stack.frontend.port}
+Backend: ${config.stack.backend.framework} ${config.stack.backend.frameworkVersion ?? ""}
+Backend language: ${config.stack.backend.language} ${config.stack.backend.languageVersion ?? ""}
+Backend runtime: http://${config.stack.backend.host}:${config.stack.backend.port}
+Database: ${config.stack.data.engine} ${config.stack.data.engineVersion ?? ""}
+Database URI: ${config.stack.data.uri}
 
 Spec project:
 ${specContext}
@@ -485,11 +489,15 @@ function buildGenerationMessages(
     {
       role: "user" as const,
       content: `Generate ${target} project files using:
-- Frontend: ${config.stack.frontend}
-- UI Library: ${config.stack.ui}
-- Frontend Language: ${config.stack.language}
-- Backend: ${config.stack.backend}
-- Database: ${config.stack.database}
+- Frontend: ${config.stack.frontend.framework} ${config.stack.frontend.frameworkVersion ?? ""}
+- UI Library: ${config.stack.frontend.ui} ${config.stack.frontend.uiVersion ?? ""}
+- Frontend language: ${config.stack.frontend.language} ${config.stack.frontend.languageVersion ?? ""}
+- Frontend runtime: http://${config.stack.frontend.host}:${config.stack.frontend.port}
+- Backend: ${config.stack.backend.framework} ${config.stack.backend.frameworkVersion ?? ""}
+- Backend language: ${config.stack.backend.language} ${config.stack.backend.languageVersion ?? ""}
+- Backend runtime: http://${config.stack.backend.host}:${config.stack.backend.port}
+- Database: ${config.stack.data.engine} ${config.stack.data.engineVersion ?? ""}
+- Database URI: ${config.stack.data.uri}
 
 Use this compile plan from the previous step as a hard guide for file layout, implementation order, and module boundaries:
 ${compilePlan.trim() || "(empty plan output)"}
@@ -531,10 +539,10 @@ ${specContext}`
 
 function getTargetInstructions(target: CompileTarget, config: ResolvedCompileConfig): string {
   if (target === "frontend") {
-    return `Focus on React + ${config.stack.ui} + ${config.stack.language}. Emit business-facing frontend files under frontend/, especially frontend/src/. Implement a complete runnable frontend app, not just isolated components. The compiler already provides frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, and root .env.example; do not emit or replace those scaffold files. Also implement pages, components, API client calls, and route wiring. Environment requirements: target modern Node 18+ compatibility; assume a Vite + React + TypeScript scaffold already exists; do not switch toolchains. Routing library requirements: the managed scaffold uses react-router-dom v6, so use v6 APIs only. Use \`Routes\`, \`Route\`, and \`Navigate\`; do not use deprecated v5 APIs such as \`Switch\`, \`Redirect\`, or \`component=\`. Networking requirements: do not hardcode absolute browser API URLs such as \`http://localhost:5000\` in frontend code; call backend APIs through same-origin relative paths such as \`/api\`. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
+    return `Focus on ${config.stack.frontend.framework} ${config.stack.frontend.frameworkVersion ?? ""} + ${config.stack.frontend.ui} ${config.stack.frontend.uiVersion ?? ""} + ${config.stack.frontend.language} ${config.stack.frontend.languageVersion ?? ""}. Emit business-facing frontend files under frontend/, especially frontend/src/. Implement a complete runnable frontend app, not just isolated components. The compiler already provides frontend/package.json, frontend/index.html, frontend/tsconfig.json, frontend/vite.config.ts, frontend/src/vite-env.d.ts, backend/requirements.txt, and root .env.example; do not emit or replace those scaffold files. Also implement pages, components, API client calls, and route wiring. Environment requirements: target Node ${config.stack.frontend.nodeVersion ?? "18"}+ compatibility; assume a Vite + ${config.stack.frontend.framework} + ${config.stack.frontend.language} scaffold already exists; do not switch toolchains. Routing library requirements: the managed scaffold uses react-router-dom v6, so use v6 APIs only. Use \`Routes\`, \`Route\`, and \`Navigate\`; do not use deprecated v5 APIs such as \`Switch\`, \`Redirect\`, or \`component=\`. Networking requirements: do not hardcode absolute browser API URLs such as \`${config.stack.frontend.proxyTarget}\` in frontend code; call backend APIs through same-origin relative paths such as \`${config.stack.frontend.apiBasePath}\`. Routing requirements: if the spec defines one or more page paths such as \`/users\`, the generated app must still render successfully at \`/\`; add a default route that redirects or navigates from \`/\` to the primary page, and add a catch-all fallback route that redirects unknown paths to a valid page instead of rendering a 404. Spec compliance requirements: preserve each page path exactly as written in the spec, render the correct page content for that route, and ensure UI field names, validation rules, and actions match the spec. Do not emit backend runtime code files.`;
   }
 
-  return `Focus on ${config.stack.backend} + ${config.stack.database}. Emit executable backend code under backend/, such as backend/app.py, route modules, services, and models. Do not emit environment scaffold files. The compiler already provides backend/requirements.txt and root .env.example; do not emit or replace them. Networking requirements: generated backend APIs should be compatible with a frontend dev server on http://localhost:3000; when appropriate, expose API routes under an /api prefix and include local-development CORS support such as Flask-Cors for http://localhost:3000 and http://127.0.0.1:3000 so browser requests are not blocked if the frontend is served separately. Spec compliance requirements: action inputs, storage fields, validation rules, and response payloads must match the spec and stay consistent with the frontend-facing API contract. Do not emit frontend runtime code files.`;
+  return `Focus on ${config.stack.backend.framework} ${config.stack.backend.frameworkVersion ?? ""} + ${config.stack.data.engine} ${config.stack.data.engineVersion ?? ""}. Emit executable backend code under backend/, such as backend/${config.stack.backend.entry}, route modules, services, and models. Do not emit environment scaffold files. The compiler already provides backend/requirements.txt and root .env.example; do not emit or replace them. Networking requirements: generated backend APIs should be compatible with a frontend dev server on http://localhost:${config.stack.frontend.port}; when appropriate, expose API routes under an ${config.stack.frontend.apiBasePath} prefix and include local-development CORS support for ${config.stack.backend.corsOrigins.join(", ")} so browser requests are not blocked if the frontend is served separately. Spec compliance requirements: action inputs, storage fields, validation rules, and response payloads must match the spec and stay consistent with the frontend-facing API contract. Do not emit frontend runtime code files.`;
 }
 
 function detectCompileTargets(
@@ -559,7 +567,9 @@ function isTargetDisabled(
   specContext: string,
   config: ResolvedCompileConfig
 ): boolean {
-  const stackValue = target === "frontend" ? config.stack.frontend : config.stack.backend;
+  const stackValue = target === "frontend"
+    ? config.stack.frontend.framework
+    : config.stack.backend.framework;
   if (isDisabledValue(stackValue)) {
     return true;
   }

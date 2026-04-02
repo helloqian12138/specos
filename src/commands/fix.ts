@@ -3,7 +3,8 @@ import fs from "node:fs/promises";
 import { ParsedArgs } from "../cli.js";
 import { OpenAIClient } from "../ai/openai-client.js";
 import { loadGlobalConfig } from "../config/global-config.js";
-import { DEFAULT_STACK, loadProjectConfig } from "../config/project-config.js";
+import { loadProjectConfig, resolveProjectStackConfig } from "../config/project-config.js";
+import { StackConfig } from "../config/types.js";
 import { readLatestProjectError } from "../debug/error-history.js";
 import { ensureDirectory, fileExists, listFilesRecursively, readTextFile, writeTextFile } from "../utils/fs.js";
 import { loadSpecProject } from "../spec/loader.js";
@@ -23,6 +24,7 @@ export async function runFixCommand(parsed: ParsedArgs): Promise<void> {
 
   const globalConfig = await loadGlobalConfig();
   const projectConfig = await loadProjectConfig(projectDir);
+  const resolvedStack = await resolveProjectStackConfig(projectDir, projectConfig);
   const host = stringFlag(parsed.flags.host) ?? globalConfig.host;
   const auth = stringFlag(parsed.flags.auth) ?? globalConfig.auth;
 
@@ -60,10 +62,7 @@ export async function runFixCommand(parsed: ParsedArgs): Promise<void> {
     latestErrorContext: latestError
       ? `Latest stored error: ${latestError.error}\nRecorded at: ${latestError.timestamp}\nCommand: ${latestError.command}`
       : "No stored error metadata found.",
-    stack: {
-      ...DEFAULT_STACK,
-      ...projectConfig.stack
-    },
+    stack: resolvedStack,
     model:
       stringFlag(parsed.flags.model) ??
       projectConfig.ai?.model ??
@@ -195,13 +194,7 @@ function buildFixPrompt(input: {
   outDir: string;
   errorMessage: string;
   latestErrorContext: string;
-  stack: {
-    frontend: string;
-    ui: string;
-    language: string;
-    backend: string;
-    database: string;
-  };
+  stack: StackConfig;
   model: string;
   specContext: string;
   projectContext: string;
@@ -219,11 +212,15 @@ function buildFixPrompt(input: {
 Project:
 - Directory: ${input.projectDir}
 - Output: ${input.outDir}
-- Frontend: ${input.stack.frontend}
-- UI: ${input.stack.ui}
-- Language: ${input.stack.language}
-- Backend: ${input.stack.backend}
-- Database: ${input.stack.database}
+- Frontend: ${input.stack.frontend.framework} ${input.stack.frontend.frameworkVersion ?? ""}
+- UI: ${input.stack.frontend.ui} ${input.stack.frontend.uiVersion ?? ""}
+- Frontend language: ${input.stack.frontend.language} ${input.stack.frontend.languageVersion ?? ""}
+- Frontend dev server: http://${input.stack.frontend.host}:${input.stack.frontend.port}
+- Backend: ${input.stack.backend.framework} ${input.stack.backend.frameworkVersion ?? ""}
+- Backend language: ${input.stack.backend.language} ${input.stack.backend.languageVersion ?? ""}
+- Backend runtime: http://${input.stack.backend.host}:${input.stack.backend.port}
+- Database: ${input.stack.data.engine} ${input.stack.data.engineVersion ?? ""}
+- Database URI: ${input.stack.data.uri}
 - Model: ${input.model}
 
 Reported error:
@@ -259,13 +256,7 @@ function buildFixApplyPrompt(input: {
   outDir: string;
   errorMessage: string;
   latestErrorContext: string;
-  stack: {
-    frontend: string;
-    ui: string;
-    language: string;
-    backend: string;
-    database: string;
-  };
+  stack: StackConfig;
   model: string;
   specContext: string;
   projectContext: string;
@@ -283,11 +274,15 @@ function buildFixApplyPrompt(input: {
 Project:
 - Directory: ${input.projectDir}
 - Output: ${input.outDir}
-- Frontend: ${input.stack.frontend}
-- UI: ${input.stack.ui}
-- Language: ${input.stack.language}
-- Backend: ${input.stack.backend}
-- Database: ${input.stack.database}
+- Frontend: ${input.stack.frontend.framework} ${input.stack.frontend.frameworkVersion ?? ""}
+- UI: ${input.stack.frontend.ui} ${input.stack.frontend.uiVersion ?? ""}
+- Frontend language: ${input.stack.frontend.language} ${input.stack.frontend.languageVersion ?? ""}
+- Frontend dev server: http://${input.stack.frontend.host}:${input.stack.frontend.port}
+- Backend: ${input.stack.backend.framework} ${input.stack.backend.frameworkVersion ?? ""}
+- Backend language: ${input.stack.backend.language} ${input.stack.backend.languageVersion ?? ""}
+- Backend runtime: http://${input.stack.backend.host}:${input.stack.backend.port}
+- Database: ${input.stack.data.engine} ${input.stack.data.engineVersion ?? ""}
+- Database URI: ${input.stack.data.uri}
 - Model: ${input.model}
 
 Reported error:

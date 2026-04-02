@@ -1,12 +1,6 @@
 export default {
   outDir: "./dist",
-  stack: {
-    frontend: "react",
-    ui: "antd",
-    language: "typescript",
-    backend: "flask",
-    database: "mongodb"
-  },
+  stackConfig: "./stack.config.js",
   ai: {
     model: "gpt-4o-mini",
     temperature: 0.2

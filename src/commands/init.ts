@@ -102,6 +102,7 @@ function resolveProjectDir(input?: string): string {
 
 async function createProjectTemplate(targetDir: string, force: boolean): Promise<void> {
   const configPath = path.join(targetDir, "spec.config.js");
+  const stackConfigPath = path.join(targetDir, "stack.config.js");
   const specPath = path.join(targetDir, "app.spec");
 
   if (!force && (await fileExists(configPath))) {
@@ -115,13 +116,7 @@ async function createProjectTemplate(targetDir: string, force: boolean): Promise
     configPath,
     `export default {
   outDir: "./dist",
-  stack: {
-    frontend: "react",
-    ui: "antd",
-    language: "typescript",
-    backend: "flask",
-    database: "mongodb"
-  },
+  stackConfig: "./stack.config.js",
   ai: {
     model: "gpt-4o-mini",
     temperature: 0.2
@@ -134,18 +129,65 @@ async function createProjectTemplate(targetDir: string, force: boolean): Promise
 `
   );
 
+  if (!(await fileExists(stackConfigPath))) {
+    await writeTextFile(
+      stackConfigPath,
+      `export default {
+  frontend: {
+    framework: "react",
+    frameworkVersion: "18.3.1",
+    ui: "antd",
+    uiVersion: "5.24.7",
+    language: "typescript",
+    languageVersion: "5.8.2",
+    nodeVersion: "20",
+    packageManager: "npm",
+    host: "0.0.0.0",
+    port: 3000,
+    apiBasePath: "/api",
+    proxyTarget: "http://127.0.0.1:5000",
+    dependencies: {
+      antd: "^5.24.7",
+      react: "^18.3.1",
+      "react-dom": "^18.3.1",
+      "react-router-dom": "^6.30.1"
+    }
+  },
+  backend: {
+    framework: "flask",
+    frameworkVersion: "3.0",
+    language: "python",
+    languageVersion: "3.11",
+    host: "127.0.0.1",
+    port: 5000,
+    entry: "app.py",
+    corsOrigins: ["http://localhost:3000", "http://127.0.0.1:3000"],
+    dependencies: {
+      Flask: "Flask>=3.0,<3.1",
+      "Flask-Cors": "Flask-Cors>=4.0,<5.0"
+    }
+  },
+  data: {
+    engine: "mongodb",
+    engineVersion: "7",
+    uri: "mongodb://127.0.0.1:27017/specos",
+    database: "specos",
+    dependencies: {
+      pymongo: "pymongo>=4.6,<5.0"
+    }
+  }
+}
+`
+    );
+  }
+
   if (!(await fileExists(specPath))) {
     await writeTextFile(
       specPath,
-      `App:
+      `App: My App
 
 Goal:
-  Describe your system here.
-
-Environment:
-  Frontend: React + Ant Design + TypeScript
-  Backend: Python + Flask
-  Data: MongoDB
+  Describe what the system does and what users can do on the main page.
 `
     );
   }

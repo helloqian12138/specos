@@ -1,16 +1,7 @@
-App: This is a User Manager System
+App: User Manager
 
 Goal:
-  Describe your system here.
-
-Environment:
-  Frontend: React + Ant Design + TypeScript
-  Backend: Python + Flask
-  Data: MongoDB
-
-Theme:
-  primaryColor = #ff1919
-  fontSize = 14px
+  Manage active users with search, create, and disable flows.
 
 ---
 
@@ -19,8 +10,8 @@ Entity User:
   name: string (required, maxLength=100)
   age: number (min=0,max=150)
   city: string
-  sex: number(0,1)
-  active: boolean (default=false)
+  sex: string (enum=Male|Female)
+  active: boolean (default=true)
 
 ---
 
@@ -58,7 +49,7 @@ Action SearchUsers:
 
 ---
 
-Action DeleteUser:
+Action DisableUser:
   Input:
     id
   Do:
@@ -71,44 +62,51 @@ Action DeleteUser:
 ---
 
 Page UsersPage (/users):
+  Summary:
+    List active users, search them, and create new ones.
+
+  Query:
+    searchKey = ""
+    page = 1
+    pageSize = 10
 
   Header:
-    text("DEMO USER MANAGE", align=center)
+    text("User Manager", align=center)
+    button("Add User", primary):
+      onClick:
+        openModal CreateUserModal
+
+  Load:
+    users = SearchUsers(searchKey, page, pageSize)
+
+  Filters:
+    input(searchKey)
+    button("Search"):
+      onClick:
+        dispatch SearchUsers
+        refresh users
 
   Content:
+    table(users):
+      columns:
+        id
+        name
+        age
+        city
+        sex
+        action:
+          button("Disable"):
+            onClick:
+              dispatch DisableUser(id = row.id)
+              refresh users
 
-    Section ActionBar:
-      layout: flex(space-between)
-
-      Left:
-        input(searchKey)
-        button("Search"):
-          onClick:
-            dispatch SearchUsers
-            refresh users
-
-      Right:
-        button("Add User", primary):
-          onClick:
-            openModal CreateUserModal
-
-    Section List:
-      table(users):
-        columns:
-          id
-          title
-          action:
-            button("Delete"):
-              onClick:
-                dispatch DeleteUser(id = row.id)
-                refresh users
+  Empty:
+    text("No users found", align=center)
 
 ---
 
 Component CreateUserModal:
-
   modal("Create User"):
-
     form:
       field name (input, required)
       field age (input-number)
@@ -123,7 +121,6 @@ Component CreateUserModal:
 ---
 
 State:
-
   users:
     source: SearchUsers
     autoLoad: true

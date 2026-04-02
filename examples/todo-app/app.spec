@@ -1,16 +1,7 @@
-Todo Manage System:
+App: Todo Manager
 
 Goal:
-  Manage personal todos.
-
-Environment:
-  Frontend: React + Ant Design + TypeScript
-  Backend: Python + Flask
-  Data: MongoDB
-
-Theme:
-  primaryColor = #1970FF
-  fontSize = 14px
+  Manage personal todos with a clear list page and a quick create flow.
 
 ---
 
@@ -22,8 +13,6 @@ Entity Todo:
 ---
 
 Action CreateTodo:
-  API POST /api/v1/createTodo
-
   Input:
     title
 
@@ -39,8 +28,6 @@ Action CreateTodo:
 ---
 
 Action SearchTodos:
-  API GET /api/v1/todoList
-
   Input:
     searchKey = "" (optional)
     page
@@ -60,8 +47,6 @@ Action SearchTodos:
 ---
 
 Action CompleteTodo:
-  API POST /api/v1/completeTodo
-
   Input:
     id
 
@@ -76,28 +61,35 @@ Action CompleteTodo:
 ---
 
 Page TodoPage (/todos):
+  Summary:
+    List open todos, search them, and complete them.
 
-  Header:
-    text("DEMO TODO MANAGE", align=center)
+  State:
+    searchKey = ""
+    page = 1
+    pageSize = 10
 
-  Content:
+  Load:
+    todos = SearchTodos(searchKey, page, pageSize)
 
-    Section ActionBar:
-      layout: flex(space-between)
-
-      Left:
-        input(searchKey)
+  Layout:
+    Header:
+      text("Todo Manager", align=center)
+    
+    Content:
+      Left (50%):
+        input(name: searchInput, value:searchKey)
         button("Search"):
           onClick:
-            dispatch SearchTodos
+            dispatch SearchTodos(searchInput.value, page, pageSize)
             refresh todos
-
-      Right:
+      Space (50% - 64px)
+      Right (64px):
         button("Add Todo", primary):
           onClick:
             openModal CreateTodoModal
 
-    Section List:
+    Content:
       table(todos):
         columns:
           id
@@ -107,13 +99,12 @@ Page TodoPage (/todos):
               onClick:
                 dispatch CompleteTodo(id = row.id)
                 refresh todos
+        empty: text("No open todos", align=center)
 
 ---
 
 Component CreateTodoModal:
-
   modal("Create Todo"):
-
     form:
       field title (input, required)
 
@@ -121,13 +112,3 @@ Component CreateTodoModal:
       dispatch CreateTodo(title = form.title)
       refresh todos
       closeModal
-
----
-
-State:
-
-  todos:
-    source: SearchTodos
-    autoLoad: true
-    page = 1
-    pageSize = 10

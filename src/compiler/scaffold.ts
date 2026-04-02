@@ -1,4 +1,5 @@
 import path from "node:path";
+import { StackConfig } from "../config/types.js";
 import { ensureDirectory, fileExists, readTextFile, writeTextFile } from "../utils/fs.js";
 
 export type ManagedScaffoldFile = {
@@ -9,19 +10,19 @@ export type ManagedScaffoldFile = {
 type ScaffoldTemplate = {
   projectPath: string;
   outputPath: string;
-  defaultContent: (specContext: string) => string;
+  defaultContent: (specContext: string, stack: StackConfig) => string;
 };
 
 const MANAGED_SCAFFOLD_TEMPLATES: ScaffoldTemplate[] = [
   {
     projectPath: ".specos/backend/requirements.txt",
     outputPath: "backend/requirements.txt",
-    defaultContent: specContext => buildManagedBackendRequirements(specContext, undefined)
+    defaultContent: (specContext, stack) => buildManagedBackendRequirements(specContext, undefined, stack)
   },
   {
     projectPath: ".specos/frontend/package.json",
     outputPath: "frontend/package.json",
-    defaultContent: specContext => buildManagedFrontendPackageJson(undefined, specContext)
+    defaultContent: (specContext, stack) => buildManagedFrontendPackageJson(undefined, specContext, stack)
   },
   {
     projectPath: ".specos/frontend/index.html",
@@ -69,17 +70,17 @@ const MANAGED_SCAFFOLD_TEMPLATES: ScaffoldTemplate[] = [
   {
     projectPath: ".specos/frontend/vite.config.ts",
     outputPath: "frontend/vite.config.ts",
-    defaultContent: () => `import { defineConfig } from "vite";
+    defaultContent: (_specContext, stack) => `import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: "0.0.0.0",
-    port: 3000,
+    host: "${stack.frontend.host}",
+    port: ${stack.frontend.port},
     proxy: {
-      "/api": {
-        target: "http://127.0.0.1:5000",
+      "${stack.frontend.apiBasePath}": {
+        target: "${stack.frontend.proxyTarget}",
         changeOrigin: true
       }
     }
@@ -96,8 +97,9 @@ export default defineConfig({
   {
     projectPath: ".specos/.env.example",
     outputPath: ".env.example",
-    defaultContent: () => `PORT=5000
-MONGO_URI=mongodb://127.0.0.1:27017/specos
+    defaultContent: (_specContext, stack) => `HOST=${stack.backend.host}
+PORT=${stack.backend.port}
+MONGO_URI=${stack.data.uri}
 `
   }
 ];
@@ -115,7 +117,8 @@ type PackageManifest = {
 
 export async function loadManagedScaffoldFiles(
   projectDir: string,
-  specContext: string
+  specContext: string,
+  stack: StackConfig
 ): Promise<ManagedScaffoldFile[]> {
   const files: ManagedScaffoldFile[] = [];
 
@@ -124,10 +127,10 @@ export async function loadManagedScaffoldFiles(
     const customContent = (await fileExists(sourcePath)) ? await readTextFile(sourcePath) : undefined;
     const content =
       template.outputPath === "frontend/package.json"
-        ? buildManagedFrontendPackageJson(customContent, specContext)
+        ? buildManagedFrontendPackageJson(customContent, specContext, stack)
         : template.outputPath === "backend/requirements.txt"
-          ? buildManagedBackendRequirements(specContext, customContent)
-        : customContent ?? template.defaultContent(specContext);
+          ? buildManagedBackendRequirements(specContext, customContent, stack)
+        : customContent ?? template.defaultContent(specContext, stack);
 
     files.push({
       path: template.outputPath,
@@ -139,6 +142,7 @@ export async function loadManagedScaffoldFiles(
 }
 
 export async function writeDefaultProjectScaffoldFiles(projectDir: string): Promise<void> {
+  const { DEFAULT_STACK } = await import("../config/project-config.js");
   for (const template of MANAGED_SCAFFOLD_TEMPLATES) {
     const targetPath = path.join(projectDir, template.projectPath);
     if (await fileExists(targetPath)) {
@@ -146,7 +150,7 @@ export async function writeDefaultProjectScaffoldFiles(projectDir: string): Prom
     }
 
     await ensureDirectory(path.dirname(targetPath));
-    await writeTextFile(targetPath, template.defaultContent(""));
+    await writeTextFile(targetPath, template.defaultContent("", DEFAULT_STACK));
   }
 }
 
@@ -186,10 +190,11 @@ export function inferNodePackageVersion(packageName: string): string {
 
 function buildManagedFrontendPackageJson(
   packageJsonContent: string | undefined,
-  specContext: string
+  specContext: string,
+  stack: StackConfig
 ): string {
   const manifest = parsePackageManifest(packageJsonContent);
-  const baseManifest = createBaseFrontendManifest();
+  const baseManifest = createBaseFrontendManifest(stack);
 
   const nextManifest: PackageManifest = {
     ...baseManifest,
@@ -229,31 +234,20 @@ function buildManagedFrontendPackageJson(
   return `${JSON.stringify(nextManifest, null, 2)}\n`;
 }
 
-function createBaseFrontendManifest(): PackageManifest {
+function createBaseFrontendManifest(stack: StackConfig): PackageManifest {
   return {
     name: "frontend",
     private: true,
     version: "0.0.0",
     type: "module",
     scripts: {
-      dev: "vite --host 0.0.0.0 --port 3000",
-      start: "vite --host 0.0.0.0 --port 3000",
+      dev: `vite --host ${stack.frontend.host} --port ${stack.frontend.port}`,
+      start: `vite --host ${stack.frontend.host} --port ${stack.frontend.port}`,
       build: "vite build",
-      preview: "vite preview --host 0.0.0.0 --port 3000"
+      preview: `vite preview --host ${stack.frontend.host} --port ${stack.frontend.port}`
     },
-    dependencies: {
-      antd: inferNodePackageVersion("antd"),
-      react: inferNodePackageVersion("react"),
-      "react-dom": inferNodePackageVersion("react-dom"),
-      "react-router-dom": inferNodePackageVersion("react-router-dom")
-    },
-    devDependencies: {
-      "@types/react": inferNodePackageVersion("@types/react"),
-      "@types/react-dom": inferNodePackageVersion("@types/react-dom"),
-      "@vitejs/plugin-react": inferNodePackageVersion("@vitejs/plugin-react"),
-      typescript: inferNodePackageVersion("typescript"),
-      vite: inferNodePackageVersion("vite")
-    }
+    dependencies: { ...stack.frontend.dependencies },
+    devDependencies: { ...stack.frontend.devDependencies }
   };
 }
 
@@ -346,7 +340,8 @@ const FRONTEND_ENVIRONMENT_PACKAGE_MAP: Record<string, string[]> = {
 
 function buildManagedBackendRequirements(
   specContext: string,
-  requirementsContent: string | undefined
+  requirementsContent: string | undefined,
+  stack: StackConfig
 ): string {
   const declaredPackages = new Map<string, string>();
 
@@ -357,6 +352,14 @@ function buildManagedBackendRequirements(
     declaredPackages.set(normalizePythonPackageKey(line), line);
   }
 
+  for (const requirement of Object.values(stack.backend.dependencies)) {
+    declaredPackages.set(normalizePythonPackageKey(requirement), requirement);
+  }
+
+  for (const requirement of Object.values(stack.data.dependencies)) {
+    declaredPackages.set(normalizePythonPackageKey(requirement), requirement);
+  }
+
   for (const packageName of extractBackendPackagesFromSpec(specContext)) {
     declaredPackages.set(normalizePythonPackageKey(packageName), packageName);
   }
@@ -365,10 +368,7 @@ function buildManagedBackendRequirements(
 }
 
 function extractBackendPackagesFromSpec(specContext: string): string[] {
-  const packages = new Set<string>([
-    inferPythonPackageRequirement("Flask"),
-    inferPythonPackageRequirement("Flask-Cors")
-  ]);
+  const packages = new Set<string>();
 
   for (const token of extractEnvironmentTokens(specContext, "Backend")) {
     for (const packageName of mapBackendEnvironmentTokenToPackages(token)) {

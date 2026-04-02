@@ -3,8 +3,8 @@ import { ParsedArgs } from "../cli.js";
 import { compileSpecProject } from "../compiler/compile.js";
 import { loadGlobalConfig } from "../config/global-config.js";
 import {
-  DEFAULT_STACK,
-  loadProjectConfig
+  loadProjectConfig,
+  resolveProjectStackConfig
 } from "../config/project-config.js";
 import { ResolvedCompileConfig } from "../config/types.js";
 
@@ -18,6 +18,7 @@ export async function runCompileCommand(parsed: ParsedArgs): Promise<void> {
   const projectDir = path.resolve(process.cwd(), projectInput);
   const globalConfig = await loadGlobalConfig();
   const projectConfig = await loadProjectConfig(projectDir);
+  const resolvedStack = await resolveProjectStackConfig(projectDir, projectConfig);
   const host = stringFlag(parsed.flags.host) ?? globalConfig.host;
   const auth = stringFlag(parsed.flags.auth) ?? globalConfig.auth;
 
@@ -39,10 +40,7 @@ export async function runCompileCommand(parsed: ParsedArgs): Promise<void> {
       projectDir,
       stringFlag(parsed.flags.outDir) ?? projectConfig.outDir ?? globalConfig.dist ?? "./dist"
     ),
-    stack: {
-      ...DEFAULT_STACK,
-      ...projectConfig.stack
-    },
+    stack: resolvedStack,
     ai: {
       temperature: projectConfig.ai?.temperature ?? 0.2
     },
