@@ -1,8 +1,11 @@
 App: User Manager
 
 Goal:
-  Manage active users with search, create, and disable flows.
+  Manage active users with search, create, and delete flow.
 
+Theme:
+    primary-color: #ff1919
+    font-size: 14px
 ---
 
 Entity User:
@@ -49,7 +52,7 @@ Action SearchUsers:
 
 ---
 
-Action DisableUser:
+Action DeleteUser:
   Input:
     id
   Do:
@@ -65,26 +68,30 @@ Page UsersPage (/users):
   Summary:
     List active users, search them, and create new ones.
 
-  Query:
+  State:
     searchKey = ""
     page = 1
     pageSize = 10
 
-  Header:
-    text("User Manager", align=center)
-    button("Add User", primary):
-      onClick:
-        openModal CreateUserModal
 
   Load:
     users = SearchUsers(searchKey, page, pageSize)
 
-  Filters:
-    input(searchKey)
-    button("Search"):
-      onClick:
-        dispatch SearchUsers
-        refresh users
+  Header:
+    text("User Manager", align=center)
+  
+  Content:
+    Left (50%):
+      input(searchKey)
+      button("Search"):
+        onClick:
+          dispatch SearchUsers
+          refresh users
+    Space (50% - 64px)
+    Right (64px):
+      button("Add User", primary):
+        onClick:
+          openModal CreateUserModal
 
   Content:
     table(users):
@@ -95,15 +102,13 @@ Page UsersPage (/users):
         city
         sex
         action:
-          button("Disable"):
+          button("Delete"):
             onClick:
-              dispatch DisableUser(id = row.id)
+              dispatch DeleteUser(id = row.id)
               refresh users
 
-  Empty:
-    text("No users found", align=center)
-
----
+  Footer:
+    text("Powered by SpecOS", align=center)
 
 Component CreateUserModal:
   modal("Create User"):
