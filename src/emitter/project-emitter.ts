@@ -1,7 +1,7 @@
 import path from "node:path";
 import type { GeneratedFile } from "../compiler/compile.js";
-import { ensureDirectory, writeJsonFile, writeTextFile } from "../utils/fs.js";
 import fs from "node:fs/promises";
+import { ensureDirectory, writeJsonFile, writeTextFile } from "../utils/fs.js";
 
 type EmitInput = {
   outDir: string;
